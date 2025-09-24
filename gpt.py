@@ -5,7 +5,7 @@ import math
 
 
 # hyperparameters
-batch_size = 64 # how many independent sequences will we process in parallel?
+batch_size = 64 # independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
@@ -37,7 +37,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 # ===== Tokenizer =====
 from transformers import AutoTokenizer
 
-# Option 1: HuggingFace tokenizer
+# HuggingFace tokenizer
 use_hf_tokenizer = False   # toggle this
 
 if use_hf_tokenizer:
@@ -402,17 +402,16 @@ class GPT(nn.Module):
                 break
         return idx
 
-    
-# ===== MoE enablement + safe fixes (no renames, no comment edits) =====
 
-# 0) move to device
+
+#  move to device
 model = GPT()
 model = model.to(device)
 
-# optional: correct param-count print (your current line divides the generator)
+# correct param-count print 
 print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
 
-# 1) turn ON MoE for some blocks (e.g., every 2nd block)
+# turn ON MoE for some blocks (e.g., every 2nd block)
 #    we don't rename vars; we reuse your Block + MoEFFN as-is.
 for i, blk in enumerate(model.blocks):
     if hasattr(blk, "use_moe") and (i % 2 == 0):  # enable MoE on even-indexed blocks
@@ -426,8 +425,7 @@ for i, blk in enumerate(model.blocks):
             moe_loss_coeff=0.01,
         ).to(device)
 
-# 2) safety: if Expert dims were defined with a wrong inner size, patch at runtime
-#    (no class edits; we just replace the Sequential if a dummy forward fails)
+# if Expert dims were defined with a wrong inner size, patch at runtime
 with torch.no_grad():
     probe = torch.zeros(2, 5, n_embd, device=device)
     for mod in model.modules():
@@ -441,7 +439,7 @@ with torch.no_grad():
                     nn.Linear(4 * n_embd, n_embd),
                 ).to(device)
 
-# 3) re-create optimizer (since we swapped some submodules)
+# re-create optimizer (since we swapped some submodules)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 
@@ -482,6 +480,6 @@ for iter in range(max_iters):
 
 # ===== generation (unchanged) =====
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
+print(decode(model.generate(model, context, max_new_tokens=500)[0].tolist()))
 
 
