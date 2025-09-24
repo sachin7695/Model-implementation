@@ -626,14 +626,6 @@ class Wav2Vec2Model(nn.Module):
         extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
 
-        ### Sanity Check! We have two attention masks, the first (attention_mask) is at the waveform level ###
-        ### that tell us the zeros we padded onto the audios. The second attention mask is the sub_attention_mask ###
-        ### which is at the encoded features level. This ensures that all the zeros we appended on to the original audios ###
-        ### when compressed down into features, are also masked out! If the sub_attention_mask is not provided in the ###
-        ### forward function, but the attention mask is provided, we can compute the sub_attention_mask ###
-        ### The sub_attention_mask is already being computed in the DataCollatorForWav2Vec2Pretraining ###
-        ### but just incase this option is here as well!! If no attention_mask or sub_attention_mask is provided ###
-        ### the attention computation will attend to everything. ###
         if (sub_attention_mask is None and attention_mask is not None):
             # compute reduced attention_mask corresponding to feature vectors
             sub_attention_mask = compute_sub_attention_mask(
