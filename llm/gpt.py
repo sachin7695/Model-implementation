@@ -3,17 +3,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math 
 import sys
-
+from windowed_attention import LocalWindowAttention
 # hyperparameters
 batch_size = 4 # independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 10000
+max_iters = 1000
 eval_interval = 500
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 384
-n_head = 6
+n_embd = 768
+n_head = 12
 n_layer = 6
 dropout = 0.2
 # ------------
@@ -181,13 +181,15 @@ class Head(nn.Module):
             #when the cache is full it can not take the next token 
             # then we need to shift one position left 
             else:
-                shift = self.cache_idx + T - block_size 
+                shift = self.cache_idx + T - block_size # shift = 1
                 self.k_cache[:, :-1, :] = self.k_cache[:, 1:, :] #1 position left shift 
                 self.v_cache[:, :-1, :] = self.v_cache[:, 1:, :] 
 
                 #assign last oen to new_k and new_v
                 self.k_cache[:, -T:, :] = k #here T =  1 one token by token 
                 self.v_cache[:, -T:, :] = v 
+
+                
 
 
 
@@ -211,14 +213,21 @@ class Head(nn.Module):
             wei = self.dropout(wei)
             out = wei @ v
 
-
+        # print(out.shape)
+        # print("========")
         return out
 
 class MHA(nn.Module):
 
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
+
+        #O(N**2) computation 
+        # self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
+
+        #O(N*W) computation 
+        # self.heads = nn.ModuleList(LocalWindowAttention(window_size=64, causal=True) for _ in range(num_heads))
+
         self.proj = nn.Linear(num_heads*head_size, n_embd)
         self.dropout = nn.Dropout(dropout)
     

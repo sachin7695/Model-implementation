@@ -1,7 +1,7 @@
 import torch 
 import torch.nn as nn 
 
-from llm.gpt import GPT, load_checkpoint, encode, decode
+from gpt import GPT, load_checkpoint, encode, decode
 
 
 # ===== INFERENCE EXAMPLE: Load and Generate =====
