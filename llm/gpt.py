@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math 
-
+import sys
 
 # hyperparameters
-batch_size = 64 # independent sequences will we process in parallel?
+batch_size = 4 # independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 5000
+max_iters = 10000
 eval_interval = 500
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -21,7 +21,7 @@ dropout = 0.2
 torch.manual_seed(1337)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open('input.txt', 'r', encoding='utf-8') as f:
+with open('/home/cmi_10101/Documents/coding/pytorch/architecture-implementation/input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 
@@ -142,26 +142,76 @@ class Head(nn.Module):
 
     def __init__(self, head_size):
         super().__init__()
+        self.head_size = head_size
         self.key = nn.Linear(n_embd, head_size, bias = False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-
         self.register_buffer('tril', torch.tril(torch.ones((block_size, block_size))))
+        self.dropout = nn.Dropout(0.2)
+
+    def reset_cache(self):
+            self.k_cache = None
+            self.v_cache = None 
+            self.cache_idx = 0
 
 
-    def forward(self,x):
+
+
+    def forward(self,x, use_cache=False):
         B, T, C = x.shape #batch, time-step, n_embd (channels)
         k = self.key(x)  #(B, T, head_size)
         q = self.query(x) #(B, T, head_size)
+        v = self.value(x)  #B, T, head_size
 
-        #calculating affinities 
-        #attn q*k.T/root(2)
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
-        wei = wei.masked_fill(self.tril[:T, :T]==0 , float("-inf"))
-        wei = F.softmax(wei, dim=-1)
-        
-        v = self.value(x)  #B, T, HS
-        out = wei@v #B, T, HS 
+        if use_cache and not self.training:
+            #initialize k/v cache if empty 
+            if self.k_cache is None or self.v_cache is None:
+                self.k_cache = torch.zeros(B, block_size, self.head_size, device=q.device) #b, T, HEAD_SIZE
+                self.v_cache = torch.zeros(B, block_size, self.head_size, device=v.device) #B, T, HEAD_SIZE
+                self.cache_idx = 0 
+
+            #update k/v cache 
+            if self.cache_idx + T <= block_size:
+                self.k_cache[:, self.cache_idx:self.cache_idx+T, :] = k #passing one token at a time for inference stage 
+                self.v_cache[:, self.cache_idx:self.cache_idx+T, :] = v 
+
+                
+            
+
+            #when the cache is full it can not take the next token 
+            # then we need to shift one position left 
+            else:
+                shift = self.cache_idx + T - block_size 
+                self.k_cache[:, :-1, :] = self.k_cache[:, 1:, :] #1 position left shift 
+                self.v_cache[:, :-1, :] = self.v_cache[:, 1:, :] 
+
+                #assign last oen to new_k and new_v
+                self.k_cache[:, -T:, :] = k #here T =  1 one token by token 
+                self.v_cache[:, -T:, :] = v 
+
+
+
+
+            self.cache_idx = min(self.cache_idx+T, block_size) #should not be outbound of block size or max_seq_len 
+
+
+            #calculating affinities 
+            #attn q*k.T/root(2)
+            wei = q @ self.k_cache.transpose(-2, -1) * k.shape[-1]**-0.5
+            wei = wei.masked_fill(self.tril[:T, :self.cache_idx]==0 , float("-inf"))
+            wei = F.softmax(wei, dim=-1)
+            
+            out = wei @ self.v_cache #B, T, HS 
+        else:
+            # ===== TRAINING MODE (or no cache requested) =====
+            # Standard full attention computation
+            wei = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
+            wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+            wei = F.softmax(wei, dim=-1)
+            wei = self.dropout(wei)
+            out = wei @ v
+
+
         return out
 
 class MHA(nn.Module):
@@ -172,9 +222,14 @@ class MHA(nn.Module):
         self.proj = nn.Linear(num_heads*head_size, n_embd)
         self.dropout = nn.Dropout(dropout)
     
+    def reset_cache(self):
+        """Reset KV cache in all heads"""
+        for head in self.heads:
+            head.reset_cache()
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+
+    def forward(self, x, use_cache = False):
+        out = torch.cat([h(x, use_cache = use_cache) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
     
@@ -183,9 +238,9 @@ class Expert(nn.Module):
     def __init__(self, n_embd, expansion = 4):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, expansion*4), #(B, T, C) -> (B, T, 4*C)
+            nn.Linear(n_embd, expansion*n_embd), #(B, T, C) -> (B, T, 4*C)
             nn.ReLU(),
-            nn.Linear(expansion*4, n_embd) #(B, T, 4*C) -> (B, T, C) 
+            nn.Linear(expansion*n_embd, n_embd) #(B, T, 4*C) -> (B, T, C) 
 
         )
     def forward(self, x):
@@ -278,6 +333,7 @@ class MoEFFN(nn.Module):
 
 class Feedforward(nn.Module):
     def __init__(self, n_embd):
+        super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4*n_embd),
             nn.ReLU(),
@@ -290,6 +346,7 @@ class Feedforward(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, n_embd, num_head, use_moe = False, n_experts  =3, moe_loss_coeff = 0.01):
+        super().__init__()
         self.head_size = n_embd // n_head 
         self.sa = MHA(num_head, self.head_size) #B, T, n_embd 
         self.ln1 = nn.LayerNorm(n_embd)
@@ -302,16 +359,33 @@ class Block(nn.Module):
         else:
             self.ffn = Feedforward(n_embd)
 
-    def forward(self, x):
-        x = x+self.sa(self.ln1(x))
+    def reset_cache(self):
+        """Reset KV cache in attention"""
+        self.sa.reset_cache()
+
+
+    def forward(self, x, use_cache = False):
+        # print(x.shape)
+        # print()
+        x = x+self.sa(self.ln1(x), use_cache=use_cache)
+        # print(x.shape)
+        # print()
+
 
         if self.use_moe:
             y, aux = self.ffn(self.ln2(x))
-            x = x+y 
-            return x, aux 
+            x = x+y
+        
+
         else:
-            x = x + self.ffn(self.ln2(x))
-        return x, torch.tensor(0.0, device=x.device) 
+            # print(self.ln2(x).shape)
+            # print()
+
+            y = self.ffn(self.ln2(x))
+            aux = torch.tensor(0.0, device=x.device)
+
+            x = x + y 
+        return x, aux
 
 
 
@@ -322,8 +396,10 @@ class GPT(nn.Module):
         super().__init__()
         self.tok_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.pos_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            *[Block(n_embd, num_head=n_head) for _ in range(n_layer)]
+        self.blocks = nn.ModuleList(
+            [Block(n_embd, num_head=n_head,
+                   use_moe=(i % 2 == 0), n_experts=3, moe_loss_coeff=0.01
+                   ) for i in range(n_layer)]
         )
 
         self.ln_f = nn.LayerNorm(n_embd)
@@ -340,8 +416,13 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std = 0.02)
 
+
+    def reset_cache(self):
+        """Reset KV cache in all blocks - call before generation"""
+        for block in self.blocks:
+            block.reset_cache()
     
-    def forward(self, idx, targets = None):
+    def forward(self, idx, targets = None, use_cache = False):
         B, T = idx.shape  #T-> seq_len (block size)
         aux_total = torch.tensor(0.0, device=idx.device)
 
@@ -390,9 +471,10 @@ class GPT(nn.Module):
 
     def generate(self, model, prompt , max_new_tokens=100, top_k=50, temperature=1.0, eos_token=None):
         model.eval()
+        self.reset_cache()
         idx = prompt.clone()
         for _ in range(max_new_tokens):
-            logits, _ = model(idx[:, -block_size:])
+            logits, _ = model(idx[:, -block_size:], use_cache = True)
             logits = logits[:, -1, :] / temperature
             probs = F.softmax(logits, dim=-1)
             topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
@@ -411,33 +493,36 @@ model = model.to(device)
 # correct param-count print 
 print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
 
+# sys.exit()
+
+
 # turn ON MoE for some blocks (e.g., every 2nd block)
 #    we don't rename vars; we reuse your Block + MoEFFN as-is.
-for i, blk in enumerate(model.blocks):
-    if hasattr(blk, "use_moe") and (i % 2 == 0):  # enable MoE on even-indexed blocks
-        use_moe = True
-        # replace the plain FFN with your MoE FFN (keeps your var names)
-        blk.ffn = MoEFFN(
-            n_embd,
-            n_experts=3,             # tweak as you like
-            expansion=4,
-            dropout=dropout,
-            moe_loss_coeff=0.01,
-        ).to(device)
+# for i, blk in enumerate(model.blocks):
+#     if hasattr(blk, "use_moe") and (i % 2 == 0):  # enable MoE on even-indexed blocks
+#         use_moe = True
+#         # replace the plain FFN with your MoE FFN (keeps your var names)
+#         blk.ffn = MoEFFN(
+#             n_embd,
+#             n_experts=3,             # tweak as you like
+#             expansion=4,
+#             dropout=dropout,
+#             moe_loss_coeff=0.01,
+#         ).to(device)
 
-# if Expert dims were defined with a wrong inner size, patch at runtime
-with torch.no_grad():
-    probe = torch.zeros(2, 5, n_embd, device=device)
-    for mod in model.modules():
-        if isinstance(mod, Expert):
-            try:
-                _ = mod(probe)
-            except Exception:
-                mod.net = nn.Sequential(
-                    nn.Linear(n_embd, 4 * n_embd),
-                    nn.ReLU(),
-                    nn.Linear(4 * n_embd, n_embd),
-                ).to(device)
+# # if Expert dims were defined with a wrong inner size, patch at runtime
+# with torch.no_grad():
+#     probe = torch.zeros(2, 5, n_embd, device=device)
+#     for mod in model.modules():
+#         if isinstance(mod, Expert):
+#             try:
+#                 _ = mod(probe)
+#             except Exception:
+#                 mod.net = nn.Sequential(
+#                     nn.Linear(n_embd, 4 * n_embd),
+#                     nn.ReLU(),
+#                     nn.Linear(4 * n_embd, n_embd),
+#                 ).to(device)
 
 # re-create optimizer (since we swapped some submodules)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -447,21 +532,94 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 from torch.cuda.amp import autocast, GradScaler
 scaler = GradScaler()
 
-# ===== MoE-aware training loop (loss already includes aux loss from your forward) =====
-for iter in range(max_iters):
+
+# ===== Checkpoint saving/loading =====
+import os
+
+checkpoint_dir = './checkpoints'
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+def save_checkpoint(model, optimizer, scaler, iter, loss, filepath):
+    """Save model checkpoint"""
+    checkpoint = {
+        'iter': iter,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'loss': loss,
+        'config': {
+            'vocab_size': vocab_size,
+            'n_embd': n_embd,
+            'n_head': n_head,
+            'n_layer': n_layer,
+            'block_size': block_size,
+            'dropout': dropout,
+        }
+    }
+    torch.save(checkpoint, filepath)
+    print(f"Checkpoint saved: {filepath}")
+
+
+
+
+def load_checkpoint(filepath, model, optimizer=None, scaler=None):
+    """Load model checkpoint"""
+    checkpoint = torch.load(filepath, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+    print(f"Checkpoint loaded: {filepath}")
+    print(f"Resumed from iteration: {checkpoint['iter']}")
+    print(f"Loss: {checkpoint['loss']:.4f}")
+    return checkpoint['iter']
+
+
+
+# Optional: Load from checkpoint if resuming training
+resume_from_checkpoint = None  # Set to checkpoint path to resume, e.g., './checkpoints/model_iter_5000.pt'
+start_iter = 0
+if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
+    start_iter = load_checkpoint(resume_from_checkpoint, model, optimizer, scaler)
+    print(f"Resuming training from iteration {start_iter}")
+else:
+    print("Starting training from scratch")
+
+# Training loop
+best_val_loss = float('inf')
+
+
+# ===== MoE-aware training loop (loss already includes aux loss from forward) =====
+for iter in range(start_iter, max_iters):
 
     # evaluate periodically (unchanged)
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
+        # Save checkpoint at evaluation intervals
+        checkpoint_path = os.path.join(checkpoint_dir, f'model_iter_{iter}.pt')
+        save_checkpoint(model, optimizer, scaler, iter, losses['val'], checkpoint_path)
+
+        # Save best model
+        if losses['val'] < best_val_loss:
+            best_val_loss = losses['val']
+            best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
+            save_checkpoint(model, optimizer, scaler, iter, losses['val'], best_model_path)
+            print(f"New best model! Val loss: {best_val_loss:.4f}")
+
+
     # batch
     xb, yb = get_batch('train')
 
-    # forward: your GPT.forward already adds aux_total to CE loss
+    # forward:PT.forward already adds aux_total to CE loss
     logits, loss = model(xb, yb)
 
-
+    # ======= mixed precsiion training =================
     with autocast(dtype=torch.bfloat16):
         logits, loss = model(xb, yb)
 
@@ -478,8 +636,71 @@ for iter in range(max_iters):
     # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     # optimizer.step()
 
-# ===== generation (unchanged) =====
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(model.generate(model, context, max_new_tokens=500)[0].tolist()))
 
+# Save final model
+final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
+save_checkpoint(model, optimizer, scaler, max_iters, losses['val'], final_model_path)
+print("\n" + "="*50)
+print(f"Training complete! Best val loss: {best_val_loss:.4f}")
+print(f"Final model saved to: {final_model_path}")
+print(f"Best model saved to: {os.path.join(checkpoint_dir, 'best_model.pt')}")
+print("="*50 + "\n")
+
+# Generate sample text
+print("Generating sample text...")
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+genearted_text = decode(model.generate(model, context, max_new_tokens=500)[0].tolist()) 
+print("\n" + "="*50)
+print("GENERATED TEXT:")
+print("="*50)
+print(genearted_text)
+print("="*50)
+
+
+# ===== INFERENCE EXAMPLE: Load and Generate =====
+def load_and_generate(checkpoint_path, prompt_text="", max_new_tokens=500, temperature=0.8, top_k=50):
+    """
+    Load a saved model and generate text
+    
+    Args:
+        checkpoint_path: Path to checkpoint file
+        prompt_text: Starting text for generation (empty string for random start)
+        max_new_tokens: Number of tokens to generate
+        temperature: Sampling temperature (higher = more random)
+        top_k: Top-k sampling parameter
+    """
+    # Create fresh model
+    inference_model = GPT().to(device)
+    
+    # Load checkpoint
+    load_checkpoint(checkpoint_path, inference_model)
+    inference_model.eval()
+    
+    # Encode prompt
+    if prompt_text:
+        context = torch.tensor([encode(prompt_text)], dtype=torch.long, device=device)
+    else:
+        context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    
+    # Generate
+    print(f"\nGenerating with prompt: '{prompt_text}'" if prompt_text else "\nGenerating from scratch...")
+    with torch.no_grad():
+        generated = inference_model.generate(inference_model, 
+            context, 
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k
+        )
+    
+    generated_text = decode(generated[0].tolist())
+    return generated_text
+
+# Example usage:
+generated = load_and_generate(
+    checkpoint_path='./checkpoints/best_model.pt',
+    prompt_text='ROMEO:',
+    max_new_tokens=300,
+    temperature=0.8
+)
+print(generated)
 
