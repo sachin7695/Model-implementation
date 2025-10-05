@@ -336,6 +336,18 @@ class MoEFFN(nn.Module):
         return y, aux_loss 
     
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 
 
@@ -589,7 +601,6 @@ def load_checkpoint(filepath, model, optimizer=None, scaler=None):
 
 
 
-# Optional: Load from checkpoint if resuming training
 resume_from_checkpoint = None  # Set to checkpoint path to resume, e.g., './checkpoints/model_iter_5000.pt'
 start_iter = 0
 if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):

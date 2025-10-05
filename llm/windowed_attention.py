@@ -276,6 +276,9 @@ class LocalWindowAttention(nn.Module):
 
         return output 
     
+
+    # ===========  My naive implementation of KV-cache for sliding window attention during inference forward propagation  =============
+    
     def forward_inference(self, x, attention_mask = None):
         B, T, C = x.shape  #usally T = 1 
         h = self.num_heads 
