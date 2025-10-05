@@ -160,7 +160,7 @@ class Head(nn.Module):
     def forward(self,x, use_cache=False):
         B, T, C = x.shape #batch, time-step, n_embd (channels)
         k = self.key(x)  #(B, T, head_size)
-        q = self.query(x) #(B, T, head_size)
+        q = self.query(x) #(B, T, head_size) 
         v = self.value(x)  #B, T, head_size
 
         if use_cache and not self.training:
@@ -226,7 +226,7 @@ class MHA(nn.Module):
         # self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
 
         #O(N*W) computation 
-        # self.heads = nn.ModuleList(LocalWindowAttention(window_size=64, causal=True) for _ in range(num_heads))
+        self.heads = nn.ModuleList(LocalWindowAttention(window_size=64, causal=True) for _ in range(num_heads))
 
         self.proj = nn.Linear(num_heads*head_size, n_embd)
         self.dropout = nn.Dropout(dropout)
@@ -502,7 +502,7 @@ model = model.to(device)
 # correct param-count print 
 print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
 
-# sys.exit()
+sys.exit()
 
 
 # turn ON MoE for some blocks (e.g., every 2nd block)
