@@ -436,4 +436,4 @@ if __name__ == "__main__":
         output = model(token, use_cache=True)
         print(f"Step {step}: cache_idx = {model.cache_idx}, output shape = {output.shape}")
     
-    print("\n✓ All tests passed!")
+    print("\n All tests passed!")
