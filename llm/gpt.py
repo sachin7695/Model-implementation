@@ -229,8 +229,6 @@ class Head(nn.Module):
             wei = self.dropout(wei)
             out = wei @ v
 
-        # print(out.shape)
-        # print("========")
         return out
 
 class MHA(nn.Module):
@@ -248,6 +246,8 @@ class MHA(nn.Module):
         #                                                 for _ in range(num_heads)
         #                                                 )
 
+        #self.head is already having the cumulative heads so we dont need to loop 
+        #it through multiple heads
         self.head = LocalWindowAttention(
             block_size=block_size, 
             window_size=64, 
@@ -397,13 +397,16 @@ class Block(nn.Module):
         super().__init__()
         self.head_size = n_embd // n_head 
         self.sa = MHA(num_head, self.head_size) #B, T, n_embd 
+
+        #replace layer norm by RMS norm
         # self.ln1 = nn.LayerNorm(n_embd)
         # self.ln2 = nn.LayerNorm(n_embd)
 
-        #replace layer norm by RMS norm
-
+        #RMS Norm layer
         self.norm1 = RMSNorm(dim=n_embd)
         self.norm2 = RMSNorm(dim=n_embd)
+
+
         self.use_moe = use_moe 
         if use_moe:
             self.ffn = MoEFFN(
@@ -418,12 +421,7 @@ class Block(nn.Module):
 
 
     def forward(self, x, use_cache = False):
-        # print(x.shape)
-        # print()
         x = x+self.sa(self.norm1(x), use_cache=use_cache)
-        # print(x.shape)
-        # print()
-
 
         if self.use_moe:
             y, aux = self.ffn(self.norm2(x))
@@ -544,6 +542,8 @@ class GPT(nn.Module):
         self.reset_cache()
         idx = prompt.clone()
         for _ in range(max_new_tokens):
+
+            #token by token generation as kv-cache takes one token at a time
             logits, _ = model(idx[:, -1:], use_cache = True)
             logits = logits[:, -1, :] / temperature
 
@@ -579,35 +579,8 @@ print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
 # sys.exit()
 
 
-# turn ON MoE for some blocks (e.g., every 2nd block)
-#    we don't rename vars; we reuse your Block + MoEFFN as-is.
-# for i, blk in enumerate(model.blocks):
-#     if hasattr(blk, "use_moe") and (i % 2 == 0):  # enable MoE on even-indexed blocks
-#         use_moe = True
-#         # replace the plain FFN with your MoE FFN (keeps your var names)
-#         blk.ffn = MoEFFN(
-#             n_embd,
-#             n_experts=3,             # tweak as you like
-#             expansion=4,
-#             dropout=dropout,
-#             moe_loss_coeff=0.01,
-#         ).to(device)
 
-# # if Expert dims were defined with a wrong inner size, patch at runtime
-# with torch.no_grad():
-#     probe = torch.zeros(2, 5, n_embd, device=device)
-#     for mod in model.modules():
-#         if isinstance(mod, Expert):
-#             try:
-#                 _ = mod(probe)
-#             except Exception:
-#                 mod.net = nn.Sequential(
-#                     nn.Linear(n_embd, 4 * n_embd),
-#                     nn.ReLU(),
-#                     nn.Linear(4 * n_embd, n_embd),
-#                 ).to(device)
-
-# re-create optimizer (since we swapped some submodules)
+# create optimizer 
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 
@@ -663,7 +636,7 @@ def load_checkpoint(filepath, model, optimizer=None, scaler=None):
 
 
 
-resume_from_checkpoint = None  # Set to checkpoint path to resume, e.g., './checkpoints/model_iter_5000.pt'
+resume_from_checkpoint = None  # Set to checkpoint path to resume,  './checkpoints/model_iter_5000.pt'
 start_iter = 0
 if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
     start_iter = load_checkpoint(resume_from_checkpoint, model, optimizer, scaler)
