@@ -45,7 +45,7 @@ def load_and_generate(checkpoint_path, prompt_text="", max_new_tokens=500, tempe
 
 if __name__ == "__main__":
     generated = load_and_generate(
-    checkpoint_path='./checkpoints/best_model.pt',
+    checkpoint_path='./checkpoints_v2/best_model.pt',
     prompt_text='ROMEO:',
     max_new_tokens=300,
     temperature=0.8

@@ -21,7 +21,7 @@ def apply_rope(
     xk = xk.permute(1, 0, 2) #seq_len, batch, dim 
     seq_len, dim_2 = mtheta_complex.shape 
 
-
+    mtheta_complex = mtheta_complex.to(xq.device)
     #we are applying rope in the attention stage so it invloves in RoPE(Q, K)
     # Convert xq to complex by reshaping last dim into pairs (real, imag): shape -> (seq_len, batch, dim // 2)
 

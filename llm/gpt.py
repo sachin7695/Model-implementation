@@ -4,12 +4,14 @@ from torch.nn import functional as F
 import math 
 import sys
 from windowed_attention import LocalWindowAttention
+from rope import compute_freq, apply_rope
+
 # hyperparameters
 batch_size = 4 # independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
 max_iters = 1000
 eval_interval = 500
-learning_rate = 3e-4
+learning_rate = 2e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 768
@@ -147,6 +149,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones((block_size, block_size))))
+        self.mtheta_complex = compute_freq(dim=n_embd, seq_len=block_size, theta_0=10000)
         self.dropout = nn.Dropout(0.2)
 
     def reset_cache(self):
@@ -159,9 +162,22 @@ class Head(nn.Module):
 
     def forward(self,x, use_cache=False):
         B, T, C = x.shape #batch, time-step, n_embd (channels)
+        #B, T, C -> x.shape
+
+        # RoPE in attention with q and k 
+        # RoPE(xq, xk) 
+        
         k = self.key(x)  #(B, T, head_size)
         q = self.query(x) #(B, T, head_size) 
         v = self.value(x)  #B, T, head_size
+
+        q, k = apply_rope(q, k, self.mtheta_complex)
+        # k, q -> T, B, C 
+
+        k = k.permute(1,0, 2).contiguous() #B, T, C
+        q = q.permute(1, 0, 2).contiguous()  # B , T, C
+
+
 
         if use_cache and not self.training:
             #initialize k/v cache if empty 
@@ -226,19 +242,30 @@ class MHA(nn.Module):
         # self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
 
         #O(N*W) computation 
-        self.heads = nn.ModuleList(LocalWindowAttention(window_size=64, causal=True) for _ in range(num_heads))
+        # self.heads = nn.ModuleList(LocalWindowAttention(block_size=block_size, 
+        #                                                 window_size=64, 
+        #                                                 causal=True) 
+        #                                                 for _ in range(num_heads)
+        #                                                 )
+
+        self.head = LocalWindowAttention(
+            block_size=block_size, 
+            window_size=64, 
+            causal=True
+            )
 
         self.proj = nn.Linear(num_heads*head_size, n_embd)
         self.dropout = nn.Dropout(dropout)
     
     def reset_cache(self):
         """Reset KV cache in all heads"""
-        for head in self.heads:
-            head.reset_cache()
+        # for head in self.head:
+        self.head.reset_cache()
 
 
     def forward(self, x, use_cache = False):
-        out = torch.cat([h(x, use_cache = use_cache) for h in self.heads], dim=-1)
+        # out = torch.cat([h(x, use_cache = use_cache) for h in self.heads], dim=-1)
+        out = self.head(x, use_cache=use_cache)
         out = self.dropout(self.proj(out))
         return out
     
@@ -370,8 +397,13 @@ class Block(nn.Module):
         super().__init__()
         self.head_size = n_embd // n_head 
         self.sa = MHA(num_head, self.head_size) #B, T, n_embd 
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+        # self.ln1 = nn.LayerNorm(n_embd)
+        # self.ln2 = nn.LayerNorm(n_embd)
+
+        #replace layer norm by RMS norm
+
+        self.norm1 = RMSNorm(dim=n_embd)
+        self.norm2 = RMSNorm(dim=n_embd)
         self.use_moe = use_moe 
         if use_moe:
             self.ffn = MoEFFN(
@@ -388,21 +420,21 @@ class Block(nn.Module):
     def forward(self, x, use_cache = False):
         # print(x.shape)
         # print()
-        x = x+self.sa(self.ln1(x), use_cache=use_cache)
+        x = x+self.sa(self.norm1(x), use_cache=use_cache)
         # print(x.shape)
         # print()
 
 
         if self.use_moe:
-            y, aux = self.ffn(self.ln2(x))
+            y, aux = self.ffn(self.norm2(x))
             x = x+y
         
 
         else:
             # print(self.ln2(x).shape)
             # print()
-
-            y = self.ffn(self.ln2(x))
+            
+            y = self.ffn(self.norm2(x))
             aux = torch.tensor(0.0, device=x.device)
 
             x = x + y 
@@ -423,8 +455,10 @@ class GPT(nn.Module):
                    ) for i in range(n_layer)]
         )
 
-        self.ln_f = nn.LayerNorm(n_embd)
+        # self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size) 
+        self.rms_norm = RMSNorm(dim=n_embd)
+
 
         self.apply(self._init_weights)
 
@@ -449,14 +483,29 @@ class GPT(nn.Module):
 
 
         tok_embd = self.tok_embedding_table(idx) #(B, T, C)
-        pos_embd = self.pos_embedding_table(torch.arange(T, device = device)) #(B, T, C)
-        x = tok_embd + pos_embd #(B, T, C)
+
+        #added RMS norm after the tokenization embedding
+        tok_embd = self.rms_norm(tok_embd) #B, T, C 
+
+
+        #Pass through RMS Layer as Mistral
+        # tok_emb = RMSNorm(dim=tok_embd.shape[-1]) #B, T, C 
+        #we will later pass through RoPE
+
+        # pos_embd = self.pos_embedding_table(torch.arange(T, device = device)) #(B, T, C)
+        # x = tok_embd + pos_embd #(B, T, C)
+
+        # now we dont need POS_emb here as we are passing it through RoPE 
+        # in the attention layer 
+        
+        x = tok_embd
 
         for block in self.blocks:
-            x, aux = block(x)
+            x, aux = block(x, use_cache=use_cache)
             aux_total += aux 
 
-        x = self.ln_f(x) #(B, T, C)
+        # x = self.ln_f(x) #(B, T, C)
+        x = self.rms_norm(x) #B, T, C
         logits = self.lm_head(x) #(B, T, vocab_size)
 
 
@@ -490,16 +539,29 @@ class GPT(nn.Module):
     #         idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
     #     return idx
 
-    def generate(self, model, prompt , max_new_tokens=100, top_k=50, temperature=1.0, eos_token=None):
+    def generate(self, model, prompt , max_new_tokens=100, top_k=50, temperature=0.8, eos_token=None):
         model.eval()
         self.reset_cache()
         idx = prompt.clone()
         for _ in range(max_new_tokens):
-            logits, _ = model(idx[:, -block_size:], use_cache = True)
+            logits, _ = model(idx[:, -1:], use_cache = True)
             logits = logits[:, -1, :] / temperature
+
+            # numerical safety clamp
+            logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
             probs = F.softmax(logits, dim=-1)
+
+
             topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
-            next_token = topk_idx.gather(-1, torch.multinomial(topk_probs, 1))
+            # next_token = topk_idx.gather(-1, torch.multinomial(topk_probs, 1))
+
+            # top-k filtering and re-normalization
+            topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # multinomial sampling
+            next_token_rel = torch.multinomial(topk_probs, 1)
+            next_token = topk_idx.gather(-1, next_token_rel)
+
             idx = torch.cat((idx, next_token), dim=1)
             if eos_token is not None and next_token.item() == eos_token:
                 break
@@ -514,7 +576,7 @@ model = model.to(device)
 # correct param-count print 
 print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
 
-sys.exit()
+# sys.exit()
 
 
 # turn ON MoE for some blocks (e.g., every 2nd block)
@@ -557,7 +619,7 @@ scaler = GradScaler()
 # ===== Checkpoint saving/loading =====
 import os
 
-checkpoint_dir = './checkpoints'
+checkpoint_dir = './checkpoints_v2'
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 def save_checkpoint(model, optimizer, scaler, iter, loss, filepath):

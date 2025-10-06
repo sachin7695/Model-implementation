@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import math 
 import torch.functional as F 
-
+from rope import compute_freq, apply_rope
 
 class LocalWindowAttention(nn.Module):
-    def __init__(self, 
+    def __init__(self,
+                 block_size, 
                  window_size = 512,
                  embedding_dim = 768,
                  num_attention_heads = 12,
@@ -24,6 +25,8 @@ class LocalWindowAttention(nn.Module):
         self.embed_dim = embedding_dim
         self.num_heads = num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads 
+        self.block_size = block_size
+        self.mtheta_complex = compute_freq(dim=self.head_dim, seq_len=self.block_size, theta_0=10000)
 
         # Projections
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
@@ -91,10 +94,10 @@ class LocalWindowAttention(nn.Module):
         for such num_windows 
         
         '''
-        print(gathered.shape)
-        if gathered.shape[2] == 3*self.window_size:
-            print("yes====")
-        print("==============")
+        # print(gathered.shape)
+        # if gathered.shape[2] == 3*self.window_size:
+        #     print("yes====")
+        # print("==============")
         return gathered 
 
 
@@ -106,14 +109,19 @@ class LocalWindowAttention(nn.Module):
         h = self.num_heads 
         head_dim = self.head_dim 
 
-        q = self.q_proj(x).view(b, ori_seq_len, h, head_dim).permute(0, 2, 1, 3).contiguous()
+        q = self.q_proj(x).view(b, ori_seq_len, h, head_dim).permute(0, 2, 1, 3).contiguous() # b,h, ori_seq_len, head_dim 
         k = self.k_proj(x).view(b, ori_seq_len, h, head_dim).permute(0,2,1,3).contiguous()
-        v = self.k_proj(x).view(b, ori_seq_len, h, head_dim).permute(0,2,1,3).contiguous()
+        v = self.v_proj(x).view(b, ori_seq_len, h, head_dim).permute(0,2,1,3).contiguous()
 
         ### Merge together Head/Batch Dimension ###
         q = q.flatten(0,1) #batched_head(b*h), seq_len, head_dim
         k = k.flatten(0,1)
         v = v.flatten(0,1)
+
+        q, k = apply_rope(q, k, self.mtheta_complex) 
+        k = k.permute(1,0, 2).contiguous() #B*h, ori_seq_len, head_dim
+        q = q.permute(1, 0, 2).contiguous()  #B*h, ori_seq_len, head_dim
+
         device = q.device
 
 
@@ -280,113 +288,223 @@ class LocalWindowAttention(nn.Module):
     # ===========  My naive implementation of KV-cache for sliding window attention during inference forward propagation  =============
     
     def forward_inference(self, x, attention_mask = None):
-        B, T, C = x.shape  #usally T = 1 
+
+        B, T, C = x.shape
         h = self.num_heads 
         head_dim = self.head_dim 
         device = x.device 
 
-        #project only new token 
-        # q (b, h, 1, head_dim)
-        # k(b, h, 1, head_dim) 
-        # v(b, h, 1, head_dim) 
-
-        q_new = self.q_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()
+        # Project new tokens
+        q_new = self.q_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()  # (B, h, T, head_dim)
         k_new = self.k_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()
         v_new = self.v_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()
 
+        # Initialize cache if needed
         if self.k_cache is None or self.v_cache is None:
-            max_cache_lean = 8192 
-            self.k_cache = torch.zeros(B, h, max_cache_lean, head_dim, device=device)
-            self.v_cache = torch.zeros(B, h, max_cache_lean, head_dim, device=device)
+            max_cache_len = self.block_size
+            self.k_cache = torch.zeros(B, h, max_cache_len, head_dim, device=device)
+            self.v_cache = torch.zeros(B, h, max_cache_len, head_dim, device=device)
             self.cache_idx = 0 
 
         cache_start = self.cache_idx 
         cache_end = self.cache_idx + T 
 
-        if cache_end > self.k_cache.shape[2]:  #out of the window size
-            # Shift cache left (like your reference)
-            shift_amount = cache_end -  self.k_cache.shape[2] 
+        # Handle cache overflow with sliding window
+        if cache_end > self.k_cache.shape[2]:
+            shift_amount = cache_end - self.k_cache.shape[2]
             self.k_cache[:, :, :-shift_amount, :] = self.k_cache[:, :, shift_amount:, :].clone()
             self.v_cache[:, :, :-shift_amount, :] = self.v_cache[:, :, shift_amount:, :].clone()
-
-            cache_start = self.k_cache.shape[2] - shift_amount  
+            cache_start = self.k_cache.shape[2] - T
             cache_end = self.k_cache.shape[2]
-            # self.cache_idx = cache_start 
 
-        self.k_cache[:, :, cache_start:cache_end,:] = k_new 
+        # Store new keys and values in cache
+        self.k_cache[:, :, cache_start:cache_end, :] = k_new
         self.v_cache[:, :, cache_start:cache_end, :] = v_new 
-        self.cache_idx = min(cache_end, self.k_cache.shape[2]) #updated index of cache 
+        self.cache_idx = cache_end
 
-        current_pos = cache_end - 1 
-        #which window this position belongs to 
-        current_window_idx = current_pos // self.window_size 
+        # Determine valid range for attention based on sliding window
+        last_pos = cache_end - 1
+        current_window_idx = last_pos // self.window_size 
+        start_window_idx = current_window_idx * self.window_size 
+        valid_start_idx = max(0, start_window_idx - self.look_backward * self.window_size)
+        valid_end_idx = cache_end
 
-        start_window_idx = current_window_idx*self.window_size 
-        #how far we can look back 
-        valid_start_idx = max(0, start_window_idx-self.look_backward*self.window_size)
-        # if self.causal:
-        valid_end_idx = cache_end 
-
-        valid_range = valid_end_idx - valid_start_idx
-
-        k_relevant = self.k_cache[:, :, valid_start_idx:valid_end_idx, :] # (B, h, valid_length, head_dim)
+        # Extract relevant keys and values from cache
+        k_relevant = self.k_cache[:, :, valid_start_idx:valid_end_idx, :]
         v_relevant = self.v_cache[:, :, valid_start_idx:valid_end_idx, :]
 
-        q_new = q_new.flatten(0,1) #b*h, 1, head_dim
-        k_new = k_relevant.flatten(0, 1) #b*h, valid_length, head_dim 
-        v_new = v_relevant.flatten(0, 1) 
-
-        #compute attention score 
-        attention_score = q_new @ k_relevant.transpose(-1, -2) # (B*h, T, valid_length)
-        attention_score = attention_score / math.sqrt(head_dim) 
-
-        #create and apply mask 
-        #create position indices for queries and keys 
-        query_pos = torch.arange(cache_start, cache_end, device=device) #(T, 1)
-        key_pos = torch.arange(valid_start_idx, valid_end_idx, device=device) #(valid_length,)
         
+        # Apply RoPE
+        # For now, reshaping for attention computation
+        q_attn = q_new.reshape(B * h, T, head_dim)
+        k_attn = k_relevant.reshape(B * h, -1, head_dim)
+        v_attn = v_relevant.reshape(B * h, -1, head_dim)
 
-        # Query at position i can only attend to keys at positions <= i
-        causal_mask = []
-        for i in range(len(key_pos)): #val_len times
-            for j in range(len(query_pos)): #T times 
-                if key_pos[i] <= query_pos[j]: 
-                    causal_mask.append(torch.tensor([True])) 
-                else:
-                    causal_mask.append(torch.tensor([False])) 
-        causal_mask = torch.cat(causal_mask, dim = 0)
-        causal_mask = causal_mask.reshape(T, len(key_pos)) #T, valid range 
-        causal_mask = causal_mask.unsqueeze(0) #Batch dim added B, T, valid_range T is 1 as we are doing token by token 
+        # Compute attention scores
+        attention_score = q_attn @ k_attn.transpose(-1, -2)  # (B*h, T, valid_length)
+        attention_score = attention_score / math.sqrt(head_dim)
 
+        # Create causal mask (vectorized)
+        query_pos = torch.arange(cache_start, cache_end, device=device).unsqueeze(1)  # (T, 1)
+        key_pos = torch.arange(valid_start_idx, valid_end_idx, device=device).unsqueeze(0)  # (1, valid_length)
+        causal_mask = key_pos > query_pos  # (T, valid_length)
+        causal_mask = causal_mask.unsqueeze(0)  # (1, T, valid_length)
 
-
-        # causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-        # causal_mask = causal_mask.unsqueeze(0)  # (1, T, valid_length)
-
-        # --- Window Boundary Mask ---
-        # Ensure tokens don't attend beyond sliding window limits
-        # Calculate distance between each query and key position
-        distances = query_pos.unsqueeze(1) - key_pos.unsqueeze(0)  # (T, valid_length)
-        
+        # Window boundary mask
+        distances = query_pos - key_pos  # (T, valid_length)
         max_backward = self.look_backward * self.window_size
         max_forward = self.look_forward * self.window_size
-        
-        # Mask tokens that are too far backward or forward
         window_mask = (distances > max_backward) | (distances < -max_forward)
         window_mask = window_mask.unsqueeze(0)  # (1, T, valid_length)
 
-        #combined mask 
-        combined_mask = causal_mask | window_mask 
+        # Combined mask
+        combined_mask = causal_mask | window_mask if self.causal else window_mask
         attention_score = attention_score.masked_fill(combined_mask, float("-inf"))
-        attention_probs = attention_score.softmax(dim=-1) #b*h, T, valid_range 
+        
+        attention_probs = attention_score.softmax(dim=-1)
         attention_probs = self.dropout(attention_probs)
 
-        output  = attention_probs @ v_relevant.flatten(0, 1) #b*h, T, head_dim 
+        # Apply attention to values
+        output = attention_probs @ v_attn  # (B*h, T, head_dim)
         output = output.view(B, h, T, head_dim)
         output = output.permute(0, 2, 1, 3).contiguous()
-        output = output.flatten(2) #B, T, emb_size 
+        output = output.flatten(2)  # (B, T, embed_dim)
         output = self.out_proj(output)
+        
         return output
+    
+
+
+    
+        # B, T, C = x.shape  #usally T = 1 
+        # h = self.num_heads 
+        # head_dim = self.head_dim 
+        # device = x.device 
+
+        # #project only new token 
+        # # q (b, h, 1, head_dim)
+        # # k(b, h, 1, head_dim) 
+        # # v(b, h, 1, head_dim) 
+
+        # q_new = self.q_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()
+        # k_new = self.k_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()
+        # v_new = self.v_proj(x).view(B, T, h, head_dim).permute(0, 2, 1, 3).contiguous()
+
+        # # q, k = apply_rope(q_new, k, self.mtheta_complex) 
+        # # k = k.permute(1,0, 2).contiguous() #B*h, ori_seq_len, head_dim
+        # # q = q.permute(1, 0, 2).contiguous()  #B*h, ori_seq_len, head_dim
+
+        # if self.k_cache is None or self.v_cache is None:
+        #     max_cache_lean = 8192 
+        #     self.k_cache = torch.zeros(B, h, max_cache_lean, head_dim, device=device)
+        #     self.v_cache = torch.zeros(B, h, max_cache_lean, head_dim, device=device)
+        #     self.cache_idx = 0 
+
+        # cache_start = self.cache_idx 
+        # cache_end = self.cache_idx + T 
+
+        # if cache_end > self.k_cache.shape[2]:  #out of the window size
+        #     # Shift cache left (like your reference)
+        #     shift_amount = cache_end -  self.k_cache.shape[2] 
+        #     self.k_cache[:, :, :-shift_amount, :] = self.k_cache[:, :, shift_amount:, :].clone()
+        #     self.v_cache[:, :, :-shift_amount, :] = self.v_cache[:, :, shift_amount:, :].clone()
+
+        #     cache_start = self.k_cache.shape[2] - shift_amount  
+        #     cache_end = self.k_cache.shape[2]
+        #     # self.cache_idx = cache_start 
+
+
+
+        # # Ensure k_new and v_new are 4D before writing to cache
+        # if k_new.dim() == 3:
+        #     k_new = k_new.view(B, h, T, head_dim)
+        # if v_new.dim() == 3:
+        #     v_new = v_new.view(B, h, T, head_dim)
+        # self.k_cache[:, :, cache_start:cache_end,:] = k_new 
+        # self.v_cache[:, :, cache_start:cache_end, :] = v_new 
+        # self.cache_idx = min(cache_end, self.k_cache.shape[2]) #updated index of cache 
+
+
+
+        # current_pos = cache_end - 1 
+        # #which window this position belongs to 
+        # current_window_idx = current_pos // self.window_size 
+
+        # start_window_idx = current_window_idx*self.window_size 
+        # #how far we can look back 
+        # valid_start_idx = max(0, start_window_idx-self.look_backward*self.window_size)
+        # # if self.causal:
+        # valid_end_idx = cache_end 
+
+        # valid_range = valid_end_idx - valid_start_idx
+        # print(f"valid range {valid_range}, {valid_start_idx - valid_end_idx}")
+
+        # k_relevant = self.k_cache[:, :, valid_start_idx:valid_end_idx, :] # (B, h, valid_length, head_dim)
+        # v_relevant = self.v_cache[:, :, valid_start_idx:valid_end_idx, :]
+
+        # print(f" shape of k_rel {k_relevant.shape} and shape of v_rel is {v_relevant.shape}")
+
+        # q_attn = q_new.reshape(B * h, T, head_dim)
+        # k_attn = k_relevant.reshape(B * h, -1, head_dim)
+        # v_attn = v_relevant.reshape(B * h, -1, head_dim)
+
+
+        # #compute attention score 
+        # attention_score = q_attn @ k_attn.transpose(-1, -2) # (B*h, T, valid_length)
+        # attention_score = attention_score / math.sqrt(head_dim) 
+        # print(f" attention score shape {attention_score.shape}")
+
+        # #create and apply mask 
+        # #create position indices for queries and keys 
+        # query_pos = torch.arange(cache_start, cache_end, device=device) #(T, 1)
+        # key_pos = torch.arange(valid_start_idx, valid_end_idx, device=device) #(valid_length,)
+        
+
+        # # Query at position i can only attend to keys at positions <= i
+        # causal_mask = []
+        # for i in range(len(key_pos)): #val_len times
+        #     for j in range(len(query_pos)): #T times 
+        #         if key_pos[i] <= query_pos[j]: 
+        #             causal_mask.append(torch.tensor([True], device=device)) 
+        #         else:
+        #             causal_mask.append(torch.tensor([False], device=device)) 
+        # causal_mask = torch.cat(causal_mask, dim = 0)
+        # causal_mask = causal_mask.reshape(T, len(key_pos)) #T, valid range 
+        # causal_mask = causal_mask.unsqueeze(0) #Batch dim added B, T, valid_range T is 1 as we are doing token by token 
+
+
+
+        # # causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        # # causal_mask = causal_mask.unsqueeze(0)  # (1, T, valid_length)
+
+        # # --- Window Boundary Mask ---
+        # # Ensure tokens don't attend beyond sliding window limits
+        # # Calculate distance between each query and key position
+        # distances = query_pos.unsqueeze(1) - key_pos.unsqueeze(0)  # (T, valid_length)
+        
+        # max_backward = self.look_backward * self.window_size
+        # max_forward = self.look_forward * self.window_size
+        
+        # # Mask tokens that are too far backward or forward
+        # window_mask = (distances > max_backward) | (distances < -max_forward)
+        # window_mask = window_mask.unsqueeze(0)  # (1, T, valid_length)
+
+        # #combined mask 
+        # combined_mask = causal_mask | window_mask 
+        # attention_score = attention_score.masked_fill(combined_mask, float("-inf"))
+        # attention_probs = attention_score.softmax(dim=-1) #b*h, T, valid_range 
+        # attention_probs = self.dropout(attention_probs)
+
+        # print("attention_probs:", attention_probs.shape)
+        # print("v_attn:", v_attn.shape)
+
+
+        # output  = attention_probs @ v_attn #b*h, T, head_dim 
+        # output = output.view(B, h, T, head_dim)
+        # output = output.permute(0, 2, 1, 3).contiguous()
+        # output = output.flatten(2) #B, T, emb_size 
+        # output = self.out_proj(output)
+        # return output
 
 
 
@@ -415,6 +533,7 @@ if __name__ == "__main__":
     
     # Create model
     model = LocalWindowAttention(
+        block_size=256,
         window_size=64,
         embedding_dim=768,
         num_attention_heads=12,
