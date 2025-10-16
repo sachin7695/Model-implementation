@@ -181,7 +181,7 @@ class Prenet(nn.Module):
         super(Prenet, self).__init__()
 
         self.dropout_p = dropout_p 
-        dims = [input_dim] + [prenet_dim for _ in range(prenet_dim)] #[80, 256, 256] 
+        dims = [input_dim] + [prenet_dim for _ in range(prenet_depth)] #[80, 256, 256] 
 
         #1st layer (80, 256)
         # 2nd layer (256, 256) 
@@ -207,9 +207,47 @@ class Prenet(nn.Module):
         for layer in self.layers:
             ### Even during inference we leave this dropout enabled to "introduce output variation" ###
             x = F.dropout(layer(x), p=self.dropout_p, training=True)
-        return x
+        return x #B, T , 256 
+    
+class LocationLayer(nn.Module):
+
+    def __init__(self,
+                 attention_n_filters,
+                 attention_kernel_size,
+                 attention_dim):
+        super(LocationLayer, self).__init__()
+
+        self.conv = ConvNorm(
+            in_channels=2 , #attention weights shape B, 2, attention_dim 
+            out_channels=attention_n_filters, kernel_size=attention_kernel_size,
+            padding="same",
+            bias=False
+        )
+
+        self.proj = LinearNorm(attention_n_filters, attention_dim, bias=False, w_init_gain="tanh")
+
+    def forward(self, attention_weights):
+        #Attention_weights.shape Bx2xattention_dim 
+        attention_weights = self.conv(attention_weights).permute(0, 2, 1).contiguous()
+        #attention_weights.shape Bxattention_Dimx32
+        attention_weights = self.proj(attention_weights) #Bxattention_dimxattention_dim
+        return attention_weights
+
+class LocalSensitiveAttention(nn.Module):
+
+    def __init__(self, 
+                 attention_dim,
+                 decoder_hidden_size,
+                 encoder_hidden_size,
+                 attention_n_filters,
+                 attention_kernel_size):
+        super(LocalSensitiveAttention, self).__init__()
+
+        self.in_proj = LinearNorm(decoder_hidden_size, attention_dim, bias=True, w_init_gain="tanh")
+        self.enc_proj = LinearNorm(encoder_hidden_size, attention_dim, bias=True, w_init_gain="tanh")
 
 
+    
         
         
 
