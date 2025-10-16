@@ -166,6 +166,49 @@ class Encoder(nn.Module):
         )
 
         return outputs
+    
+
+class Prenet(nn.Module):
+
+    # at each decoder step we pass the prev generated mel spec to 
+    # to pre net layer to get the feature extracted and pass to the lstm and attention  
+
+    def __init__(self, 
+                 input_dim, # 80 mel bins 80 dim vector for each time frame
+                 prenet_dim,  #256
+                 prenet_depth, # 2 layer
+                 dropout_p = 0.5):
+        super(Prenet, self).__init__()
+
+        self.dropout_p = dropout_p 
+        dims = [input_dim] + [prenet_dim for _ in range(prenet_dim)] #[80, 256, 256] 
+
+        #1st layer (80, 256)
+        # 2nd layer (256, 256) 
+
+        #zip the dim or pair it  
+        self.layers = nn.ModuleList()
+        for in_dim, out_dim in zip(dims[:-1], dims[1:]):
+            self.layers.append(
+                nn.Sequential(
+                    LinearNorm(in_features=in_dim,
+                               out_features=out_dim,
+                               bias=False,
+                               w_init_gain="relu"
+                    ),
+                    nn.ReLU()
+
+                )
+            )
+
+            #(80, 256) -> (256, 256) -> output dim 256 dim hidden vector of acoustic feature 
+
+    def forward(self, x): 
+        for layer in self.layers:
+            ### Even during inference we leave this dropout enabled to "introduce output variation" ###
+            x = F.dropout(layer(x), p=self.dropout_p, training=True)
+        return x
+
 
         
         
