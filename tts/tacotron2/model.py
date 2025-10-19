@@ -8,21 +8,21 @@ from dataclasses import dataclass
 @dataclass
 class Tacotron2Config:
 
-    ### Mel Input Features ###
+    # Mel Input Features #
     num_mels: int = 80 
 
-    ### Character Embeddings ###
+    # Character Embeddings #
     character_embed_dim: int = 512
     num_chars: int = 67
     pad_token_id: int = 0
 
-    ### Encoder config ###
+    # Encoder config #
     encoder_kernel_size: int = 5
     encoder_n_convolutions: int = 3
     encoder_embed_dim: int = 512
     encoder_dropout_p: float = 0.5
     
-    ### Decoder Config ###
+    # Decoder Config #
     decoder_embed_dim: int = 1024
     decoder_prenet_dim: int = 256
     decoder_prenet_depth: int = 2
@@ -33,7 +33,7 @@ class Tacotron2Config:
     decoder_postnet_dropout_p: float = 0.5
     decoder_dropout_p: float = 0.1
 
-    ### Attention Config ###
+    # Attention Config #
     attention_dim: int = 128
     attention_location_n_filters: int = 32
     attention_location_kernel_size: int = 31
@@ -205,7 +205,7 @@ class Prenet(nn.Module):
 
     def forward(self, x): 
         for layer in self.layers:
-            ### Even during inference we leave this dropout enabled to "introduce output variation" ###
+            # Even during inference we leave this dropout enabled to "introduce output variation" #
             x = F.dropout(layer(x), p=self.dropout_p, training=True)
         return x #B, T , 256 
     
@@ -214,23 +214,25 @@ class LocationLayer(nn.Module):
     def __init__(self,
                  attention_n_filters,
                  attention_kernel_size,
-                 attention_dim):
+                 attention_dim=128):
         super(LocationLayer, self).__init__()
 
         self.conv = ConvNorm(
-            in_channels=2 , #attention weights shape B, 2, attention_dim 
+            in_channels=2 , #attention weights shape (B, 2, 128) -> (B, 32, 128)
             out_channels=attention_n_filters, kernel_size=attention_kernel_size,
             padding="same",
             bias=False
-        )
+        ) 
 
+
+        # (B, 32, 128) -> (B, 12)
         self.proj = LinearNorm(attention_n_filters, attention_dim, bias=False, w_init_gain="tanh")
 
     def forward(self, attention_weights):
-        #Attention_weights.shape Bx2xattention_dim 
+        #Attention_weights.shape (B, 2, seq_len)  
         attention_weights = self.conv(attention_weights).permute(0, 2, 1).contiguous()
-        #attention_weights.shape Bxattention_Dimx32
-        attention_weights = self.proj(attention_weights) #Bxattention_dimxattention_dim
+        #attention_weights.shape (B, 32, seq_len)
+        attention_weights = self.proj(attention_weights) # (B,128, seq_len)
         return attention_weights
 
 class LocalSensitiveAttention(nn.Module):
@@ -243,15 +245,22 @@ class LocalSensitiveAttention(nn.Module):
                  attention_kernel_size):
         super(LocalSensitiveAttention, self).__init__()
 
+
+        # lstm layer hidden dim to attention compressed dim  1024 -> 128
         self.in_proj = LinearNorm(decoder_hidden_size, attention_dim, bias=True, w_init_gain="tanh")
+
+        # encoder dim to attention compressed dim 512 -> 128
         self.enc_proj = LinearNorm(encoder_hidden_size, attention_dim, bias=True, w_init_gain="tanh")
 
 
+        # Convolution layer to project  (B, 2, seq_len) -> (B, 32, seq_len)  feat. vec having the alignment feat. so far
         self.what_i_have_said = LocationLayer(
             attention_n_filters,
             attention_kernel_size,
             attention_dim
-        )
+        ) 
+
+
 
         self.energy_proj = LinearNorm(attention_dim, 1, bias=False, w_init_gain="tanh")
         self.reset() 
@@ -260,30 +269,41 @@ class LocalSensitiveAttention(nn.Module):
         self.enc_proj_cache = None 
 
     def _calculate_alignment_energies(self, 
-                                    mel_input, 
+                                    mel_input,  #(B, 80) for each time step 80 dim vector pass through lstm for 1024 dim
                                     encoder_output, 
                                     cumulative_attention_weights, 
                                     mask=None):
 
-        ### Take our previous step of the mel sequence and project it (B x 1 x attention_dim)
-        mel_proj = self.in_proj(mel_input).unsqueeze(1)
+        # Take our previous step of the mel sequence and project it (B x 1 x attention_dim)
+        mel_proj = self.in_proj(mel_input) # (B, 1024) -> (B, attention_dim=128)
+        mel_proj = mel_proj.unsqueeze(1) # (B x 1 x attention_dim=128)
 
-        ### Take our entire encoder output and project it (B x encoder_len x attention_dim)
+        # Take our entire encoder output and project it to (B x #chars x attention_dim)
+        # encoder_len means number of characters that text has 
+        # you need to compute only once as the number of characters is constant for all time steps 
+        # that's why we can put it in a cache  to reuse for remaining time steps
+
         if self.enc_proj_cache is None:
-            self.enc_proj_cache = self.enc_proj(encoder_output)
+            self.enc_proj_cache = self.enc_proj(encoder_output) #(B, #chars, 128)
 
-        ### Look at our attention weight history to understand where the model has already placed attention 
-        cumulative_attention_weights = self.what_have_i_said(cumulative_attention_weights)
+        # Look at our attention weight history to understand where the model has already placed attention
+        # (B, 2, #chars) -> (B, 32, #chars) -> (B, #chars, 128)
+        cumulative_attention_weights = self.what_have_i_said(cumulative_attention_weights) #(B, #chars, 128)
 
-        ### Broadcast sum the single mel timestep over all of our encoder timesteps (both attention weight features and encoder features)
-        ### And scale with tanh to get scores between -1 and 1, and project to a single value to comput energies
+        # Broadcast sum the single mel timestep over all of our encoder timesteps 
+        # (both attention weight features and encoder features)
+        # And scale with tanh to get scores between -1 and 1, and project to a single value to comput energies
+
+        # mel_proj (B, 1, 128) 
+        # enc_proj_cache (B, #chars, 128)
+        # cumulative_attention_weights (B, #chars, 128)
         energies = self.energy_proj(
             torch.tanh(
                 mel_proj + self.enc_proj_cache + cumulative_attention_weights
             )
-        ).squeeze(-1)
+        ).squeeze(-1) # final shape (B, #chars) for each time step mel input one number for one character
         
-        ### Mask out pad regions (dont want to weight pad tokens from encoder)
+        # Mask out pad regions (dont want to weight pad tokens from encoder)
         if mask is not None:
             energies = energies.masked_fill(mask.bool(), -float("inf"))
         
@@ -295,19 +315,99 @@ class LocalSensitiveAttention(nn.Module):
                 cumulative_attention_weights, 
                 mask=None):
 
-        ### Compute energies ###
+        # Compute energies (B, #chars)
         energies = self._calculate_alignment_energies(mel_input, 
                                                       encoder_output, 
                                                       cumulative_attention_weights, 
                                                       mask)
         
-        ### Convert to Probabilities (relation of our mel input to all the encoder outputs) ###
+        # Convert to Probabilities (relation of our mel input to all the encoder outputs) #
         attention_weights = F.softmax(energies, dim=1)
 
-        ### Weighted average of our encoder states by the learned probabilities 
+        # Weighted average of our encoder states by the learned probabilities 
+
+        # just like softmax(Q@K.T) for attention context
+        # batch matrix multiplication torch.bmm
+        # (B, 1, #chars) @ (B, #chars, embed_dim) to get the attention context vector 
         attention_context = torch.bmm(attention_weights.unsqueeze(1), encoder_output).squeeze(1)
 
         return attention_context, attention_weights
+    
+
+class PostNet(nn.Module):
+    
+    '''
+    To take final generated Mel spec from LSTM and postprocess to allow for
+    any missing details to be added in (learns the residual!) 
+    '''
+    def __init__(self, 
+                 num_mels=80, 
+                 postnet_num_convs = 5,
+                 postnet_n_filters = 512,
+                 postnet_kernel_size = 5,
+                 postnet_dropout = 0.5):
+        super(PostNet, self).__init__() 
+
+        self.convs = nn.ModuleList()
+
+        self.convs.append( # 1 time
+            nn.Sequential(
+                ConvNorm(in_channels=num_mels,
+                         out_channels=postnet_n_filters,
+                         kernel_size=postnet_kernel_size,
+                         padding="same",
+                         w_init_gain="tanh"),
+
+                nn.BatchNorm1d(num_features=postnet_n_filters),
+                nn.Tanh(),
+                nn.Dropout(postnet_dropout)
+            )
+        )
+
+
+        for _ in range(postnet_num_convs - 2): # 3 times
+            
+            self.convs.append(
+                nn.Sequential(
+                    ConvNorm(postnet_n_filters, 
+                             postnet_n_filters, 
+                             kernel_size=postnet_kernel_size, 
+                             padding="same",
+                             w_init_gain="tanh"), 
+
+                    nn.BatchNorm1d(postnet_n_filters),
+                    nn.Tanh(), 
+                    nn.Dropout(postnet_dropout)
+                )
+            )
+
+        # remining one time out of 5 times 
+        self.convs.append(
+            nn.Sequential(
+                ConvNorm(postnet_n_filters,
+                         num_mels,
+                         kernel_size=postnet_kernel_size,
+                         padding="same"),
+                nn.BatchNorm1d(num_mels),
+                nn.Dropout(postnet_dropout)
+            )
+        )
+
+
+    def forward(self, x):
+        # x is from lstm linear project layer  (see the paper)
+        # x.shape (B, #chars, embed_dim)
+        
+        #for conv embed_dim is the in_channels
+        x = x.transpose(1, 2) 
+        for conv_block in self.convs:
+            x = conv_block(x)
+
+        x = x.transpose(1, 2) #(B, 80)
+        return x 
+    
+
+
 
 
     
