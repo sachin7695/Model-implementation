@@ -395,17 +395,70 @@ class PostNet(nn.Module):
 
 
     def forward(self, x):
-        # x is from lstm linear project layer  (see the paper)
-        # x.shape (B, #chars, embed_dim)
-        
-        #for conv embed_dim is the in_channels
+
+        #The postnet expects (batch x #chars x num_mels) 
+        # but our convolution is almost the sequence dimension. 
+        # So we transpose it first to (batch x num_mels x #chars) 
+        # do our convolutions and then transpose back! 
         x = x.transpose(1, 2) 
         for conv_block in self.convs:
             x = conv_block(x)
 
-        x = x.transpose(1, 2) #(B, 80)
+        x = x.transpose(1, 2) #(B, #chars, num_mels)
         return x 
     
+class Decoder(nn.Module):
+    def __init__(self, config):
+        super(Decoder, self).__init__()
+        self.config = config
+
+        #new decoder step is coming from prenet 
+        #current decoder step from prenet and attention context from encoder 
+        # passing to lstm 
+        # Predictions from previous timestep passed through a few linear layers
+        self.prenet = Prenet(input_dim=config.num_mels,
+                             prenet_dim = self.config.decoder_prenet_dim,
+                             prenet_depth=self.config.decoder_prenet_depth)
+
+        # LSTMs Module to Process Concatenated PreNet output and Attention Context Vector
+
+        self.rnn = nn.ModuleList(
+            [
+                nn.LSTMCell(self.config.decoder_prenet_dim + self.config.encoder_embed_dim,
+                            hidden_size=self.config.decoder_embed_dim),
+                nn.LSTMCell(self.config.decoder_embed_dim + self.config.encoder_embed_dim, 
+                            self.config.decoder_embed_dim)
+            ]
+        ) 
+
+        # Local Sensitive Attention Module
+        self.attention = LocalSensitiveAttention(attention_dim=self.config.attention_dim, 
+                                                 decoder_hidden_size=self.config.decoder_embed_dim,
+                                                 encoder_hidden_size=self.config.encoder_embed_dim, 
+                                                 attention_n_filters=self.config.attention_location_n_filters, 
+                                                 attention_kernel_size=self.config.attention_location_kernel_size)
+    
+
+
+        # predict next mel 
+        # 2 linear layer after LSTM cell 
+        # one for postnet another for stop token pred
+        self.mel_proj =  LinearNorm(self.config.decoder_embed_dim + self.config.encoder_embed_dim, 
+                                    self.config.num_mels)
+        
+        # whether its a stop token or not 
+        # binary classification
+        self.stop_proj = LinearNorm(self.config.decoder_embed_dim + self.config.encoder_emmbed_dim,
+                                    1, w_init_gain="sigmoid")
+
+        # Post Process Predicted Mel 
+        self.postnet = PostNet(
+            num_mels=config.num_mels, 
+            postnet_num_convs=config.decoder_postnet_num_convs,
+            postnet_n_filters=config.decoder_postnet_n_filters, 
+            postnet_kernel_size=config.decoder_postnet_kernel_size,
+            postnet_dropout=config.decoder_postnet_dropout_p
+        )
 
 
 
