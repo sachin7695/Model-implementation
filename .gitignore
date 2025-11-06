@@ -1,0 +1,8 @@
+llm/checkpoints 
+llm/checkpoints_v2
+*.pt
+*.txt
+llm/__pycache__
+*.wav
+tts/LJSpeech-1.1
+diffusion/

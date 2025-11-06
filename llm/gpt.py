@@ -9,14 +9,14 @@ from rope import compute_freq, apply_rope
 # hyperparameters
 batch_size = 4 # independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
-max_iters = 1000
-eval_interval = 500
+max_iters = 10000
+eval_interval = 2500
 learning_rate = 2e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
+eval_iters = 1500
 n_embd = 768
 n_head = 12
-n_layer = 6
+n_layer = 8
 dropout = 0.2
 # ------------
 
@@ -144,90 +144,167 @@ class Head(nn.Module):
 
     def __init__(self, head_size):
         super().__init__()
-        self.head_size = head_size
-        self.key = nn.Linear(n_embd, head_size, bias = False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones((block_size, block_size))))
+        self.head_size = head_size  # n_embed // num_heads
+        self.context_length = block_size 
+        self.cap_cache_to_ctx = True
+
+
+        self.w_key = nn.Linear(n_embd, head_size, bias = False)
+        self.w_query = nn.Linear(n_embd, head_size, bias=False)
+        self.w_value = nn.Linear(n_embd, head_size, bias=False)
+
+
+        self.register_buffer('mask', 
+                            torch.tril(torch.ones((block_size, block_size))),
+                            persistent=False) # block size is context length
         self.mtheta_complex = compute_freq(dim=n_embd, seq_len=block_size, theta_0=10000)
         self.dropout = nn.Dropout(0.2)
 
+
+        # for KV-cache
+        self.register_buffer("k_cache", None, persistent=False)
+        self.register_buffer("v_cache", None, persistent=False)
+        self.ptr_current_pos = 0
+
+    # def reset_cache(self):
+    #         self.k_cache = None
+    #         self.v_cache = None 
+    #         self.cache_idx = 0
+
     def reset_cache(self):
-            self.k_cache = None
-            self.v_cache = None 
-            self.cache_idx = 0
+        self.k_cache, self.v_cache = None, None 
+        self.pt_curr_pos  = 0
 
-
+    def _maybe_cap_cache(self):
+        """Keep only the most recent `context_length` tokens in cache (optional)."""
+        if not self.cap_cache_to_ctx:
+            return
+        if self.k_cache is None:
+            return
+        cur_len = self.k_cache.size(1)
+        if cur_len > self.context_length:
+            keep = self.context_length
+            self.k_cache = self.k_cache[:, cur_len - keep :, :]
+            self.v_cache = self.v_cache[:, cur_len - keep :, :]
+            # When we cap, we also need to cap the ptr so mask slicing stays valid
+            self.ptr_current_pos = min(self.ptr_current_pos, self.context_length)
 
 
     def forward(self,x, use_cache=False):
-        B, T, C = x.shape #batch, time-step, n_embd (channels)
-        #B, T, C -> x.shape
+        B, T, C = x.shape #batch, time-step, n_embd (channels) in inference stage for kv cache T=1
+
+        keys_new = self.w_key(x) # (B, T, HS)
+        values_new = self.w_value(x) # (B, T, HS)
+        q = self.w_query(x) 
+
 
         # RoPE in attention with q and k 
         # RoPE(xq, xk) 
         
-        k = self.key(x)  #(B, T, head_size)
-        q = self.query(x) #(B, T, head_size) 
-        v = self.value(x)  #B, T, head_size
+        # k = self.w_key(x)  #(B, T, head_size)
+        # q = self.w_query(x) #(B, T, head_size) 
+        # v = self.w_value(x)  #B, T, head_size
 
-        q, k = apply_rope(q, k, self.mtheta_complex)
-        # k, q -> T, B, C 
 
-        k = k.permute(1,0, 2).contiguous() #B, T, C
+        # RoPE apply
+        q, keys_new = apply_rope(q, keys_new, self.mtheta_complex)
+        # k, q -> T, B, C the RoPE chnaged this dimension  thats why we have permute it again to (B, T, C)
+        keys_new = keys_new.permute(1,0, 2).contiguous() #B, T, C
         q = q.permute(1, 0, 2).contiguous()  # B , T, C
 
 
+        if use_cache and not self.training:
+            if self.k_cache is None:
+                self.k_cache, self.v_cache  = keys_new, values_new 
+            else:
+                self.k_cache = torch.cat([self.k_cache, keys_new], dim=1)
+                self.v_cache = torch.cat([self.v_cache, values_new], dim=1)
+
+            
+            keys, values = self.k_cache, self.v_cache 
+        else:
+            keys, values = keys_new, values_new # B, T, HS
+
+        keys = keys.permute(0, 2, 1).contiguous() # B, HS, T
+        attn_scores = q @ keys # B, 1, HS @ B, HS, T  -> B, 1, T
+
+        num_tokens_q = q.shape[1]
+        num_tokens_k = keys.shape[1] 
 
         if use_cache and not self.training:
-            #initialize k/v cache if empty 
-            if self.k_cache is None or self.v_cache is None:
-                self.k_cache = torch.zeros(B, block_size, self.head_size, device=q.device) #b, T, HEAD_SIZE
-                self.v_cache = torch.zeros(B, block_size, self.head_size, device=v.device) #B, T, HEAD_SIZE
-                self.cache_idx = 0 
+            # mask_bool = self.mask.bool()[
+            #     self.pt_curr_pos:self.ptr_current_pos+num_tokens_q, :num_tokens_k
+            # ]
+            # self.ptr_current_pos += num_tokens_q 
 
-            #update k/v cache 
-            if self.cache_idx + T <= block_size:
-                self.k_cache[:, self.cache_idx:self.cache_idx+T, :] = k #passing one token at a time for inference stage 
-                self.v_cache[:, self.cache_idx:self.cache_idx+T, :] = v 
-
-                
-            
-
-            #when the cache is full it can not take the next token 
-            # then we need to shift one position left 
-            else:
-                shift = self.cache_idx + T - block_size # shift = 1
-                self.k_cache[:, :-1, :] = self.k_cache[:, 1:, :] #1 position left shift 
-                self.v_cache[:, :-1, :] = self.v_cache[:, 1:, :] 
-
-                #assign last oen to new_k and new_v
-                self.k_cache[:, -T:, :] = k #here T =  1 one token by token 
-                self.v_cache[:, -T:, :] = v 
-
-                
+            past_len = self.ptr_current_pos 
+            # build rectangular causal mask dynamically 
+            i = torch.arange(num_tokens_q, device=x.device).unsqueeze(1) # T, 1
+            j = torch.arange(num_tokens_k, device=x.device).unsqueeze(0) # 1, T 
 
 
+            # each query i can attend to all past (past_len) + tokens up to itself (i)
+            mask_bool = (j > (past_len + i))  # True means MASK
+            # self.ptr_current_pos += num_tokens_q 
 
 
-            self.cache_idx = min(self.cache_idx+T, block_size) #should not be outbound of block size or max_seq_len 
-
-
-            #calculating affinities 
-            #attn q*k.T/root(2)
-            wei = q @ self.k_cache.transpose(-2, -1) * k.shape[-1]**-0.5
-            wei = wei.masked_fill(self.tril[:T, :self.cache_idx]==0 , float("-inf"))
-            wei = F.softmax(wei, dim=-1)
-            
-            out = wei @ self.v_cache #B, T, HS 
         else:
-            # ===== TRAINING MODE (or no cache requested) =====
-            # Standard full attention computation
-            wei = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
-            wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-            wei = F.softmax(wei, dim=-1)
-            wei = self.dropout(wei)
-            out = wei @ v
+            # mask_bool = self.mask.bool()[:num_tokens_q, :num_tokens_k]]
+            i = torch.arange(num_tokens_q, device=x.device).unsqueeze(1)
+            j = torch.arange(num_tokens_k, device=x.device).unsqueeze(0)
+            mask_bool = (j > i)  # simple causal mask for training (no past)
+        
+        attn_scores.masked_fill(mask_bool, float("-inf"))
+        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        out = attn_weights @ values
+
+
+
+
+        # if use_cache and not self.training:
+        #     #initialize k/v cache if empty 
+        #     if self.k_cache is None or self.v_cache is None:
+        #         self.k_cache = torch.zeros(B, block_size, self.head_size, device=q.device) #b, T, HEAD_SIZE
+        #         self.v_cache = torch.zeros(B, block_size, self.head_size, device=v.device) #B, T, HEAD_SIZE
+        #         self.cache_idx = 0 
+
+        #     #update k/v cache 
+        #     if self.cache_idx + T <= block_size:
+        #         self.k_cache[:, self.cache_idx:self.cache_idx+T, :] = k #passing one token at a time for inference stage 
+        #         self.v_cache[:, self.cache_idx:self.cache_idx+T, :] = v 
+
+
+        #     #when the cache is full it can not take the next token 
+        #     # then we need to shift one position left 
+        #     else:
+        #         shift = self.cache_idx + T - block_size # shift = 1
+        #         self.k_cache[:, :-1, :] = self.k_cache[:, 1:, :] #1 position left shift 
+        #         self.v_cache[:, :-1, :] = self.v_cache[:, 1:, :] 
+
+        #         #assign last oen to new_k and new_v
+        #         self.k_cache[:, -T:, :] = k #here T =  1 one token by token 
+        #         self.v_cache[:, -T:, :] = v
+        #     self.cache_idx = min(self.cache_idx+T, block_size) #should not be outbound of block size or max_seq_len 
+
+
+        #     #calculating affinities 
+        #     #attn q*k.T/root(2)
+        #     wei = q @ self.k_cache.transpose(-2, -1) * k.shape[-1]**-0.5
+        #     wei = wei.masked_fill(self.tril[:T, :self.cache_idx]==0 , float("-inf"))
+        #     wei = F.softmax(wei, dim=-1)
+            
+        #     out = wei @ self.v_cache #B, T, HS 
+        # else:
+        #     # ===== TRAINING MODE (or no cache requested) =====
+        #     # Standard full attention computation
+        #     wei = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
+        #     wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        #     wei = F.softmax(wei, dim=-1)
+        #     wei = self.dropout(wei)
+        #     out = wei @ v 
+        
+
 
         return out
 
@@ -592,7 +669,7 @@ scaler = GradScaler()
 # ===== Checkpoint saving/loading =====
 import os
 
-checkpoint_dir = './checkpoints_v2'
+checkpoint_dir = './checkpoints_v3'
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 def save_checkpoint(model, optimizer, scaler, iter, loss, filepath):
