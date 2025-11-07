@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math 
-import sys
+import sys, os
 from windowed_attention import LocalWindowAttention
 from rope import compute_freq, apply_rope
+import tiktoken 
+import time
+from torch.cuda.amp import autocast, GradScaler
 
 # hyperparameters
 batch_size = 4 # independent sequences will we process in parallel?
@@ -18,6 +21,8 @@ n_embd = 768
 n_head = 12
 n_layer = 8
 dropout = 0.2
+vocab_size_new = 50257
+sliding_window_size = 64
 # ------------
 
 torch.manual_seed(1337)
@@ -29,31 +34,23 @@ with open('/home/cmi_10101/Documents/coding/pytorch/architecture-implementation/
 
 # #tokenization on the basis of character
 
-# chars = sorted(list(set(text))) #list of characters
-# vocab_size = len(chars)
-# stoi = {ch:i for i, ch in enumerate(chars)}
-# itos = {i:ch for i, ch in enumerate(chars)}
-# encode  = lambda s: [stoi[c] for c in s] #takes a string s and output a list of numbers
-# decode = lambda lst : ''.join([itos[l] for l in lst]) #decoder takes a list of numbers and outputs a joined string
 
 # ===== Tokenizer =====
-from transformers import AutoTokenizer
+# Tiktoken tokenizer
+use_tiktoken = False  # toggle this
 
-# HuggingFace tokenizer
-use_hf_tokenizer = False   # toggle this
-
-if use_hf_tokenizer:
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", token="...")
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    vocab_size = len(tokenizer.get_vocab())
+if use_tiktoken:
+    tokenizer = tiktoken.get_encoding("gpt2") 
+    vocab_size = 50257
 
     def encode(s):
-        return tokenizer.encode(s, truncation=True, max_length=block_size)
+        return tokenizer.encode(s)
     def decode(l):
         return tokenizer.decode(l)
 
 else:
-    # Fallback: char-level (your original code)
+    # Fallback: char-level (Karapathy style)
+    # tokenization on the basis of character
     chars = sorted(list(set(text)))
     vocab_size = len(chars)
     stoi = {ch: i for i, ch in enumerate(chars)}
@@ -83,10 +80,6 @@ class CharDataset(Dataset):
 train_loader = DataLoader(CharDataset(train_data, block_size), batch_size=batch_size, shuffle=True, drop_last=True)
 val_loader   = DataLoader(CharDataset(val_data, block_size), batch_size=batch_size, drop_last=True)
 
-
-
-
-
 def get_batch_from_loader(loader_iter, loader):
     try:
         x, y = next(loader_iter)
@@ -112,11 +105,7 @@ def get_lr(it, max_lr, warmup_iters, lr_decay_iters, min_lr):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-
-
-
 #data loading
-
 def get_batch(split):
     data  = train_data if split=="train" else val_data 
     ix = torch.randint(len(data)-block_size, size=(batch_size,)) #[10, 30, 56, 78]
@@ -124,20 +113,6 @@ def get_batch(split):
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     x,y = x.to(device), y.to(device)
     return x, y 
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
 
 
 class Head(nn.Module):
@@ -147,6 +122,7 @@ class Head(nn.Module):
         self.head_size = head_size  # n_embed // num_heads
         self.context_length = block_size 
         self.cap_cache_to_ctx = True
+        self.sliding_window_size = sliding_window_size
 
 
         self.w_key = nn.Linear(n_embd, head_size, bias = False)
@@ -166,14 +142,9 @@ class Head(nn.Module):
         self.register_buffer("v_cache", None, persistent=False)
         self.ptr_current_pos = 0
 
-    # def reset_cache(self):
-    #         self.k_cache = None
-    #         self.v_cache = None 
-    #         self.cache_idx = 0
-
     def reset_cache(self):
         self.k_cache, self.v_cache = None, None 
-        self.pt_curr_pos  = 0
+        self.pt_current_pos  = 0
 
     def _maybe_cap_cache(self):
         """Keep only the most recent `context_length` tokens in cache (optional)."""
@@ -207,13 +178,16 @@ class Head(nn.Module):
 
 
         # RoPE apply
-        q, keys_new = apply_rope(q, keys_new, self.mtheta_complex)
+        # q, keys_new = apply_rope(q, keys_new, self.mtheta_complex)
         # k, q -> T, B, C the RoPE chnaged this dimension  thats why we have permute it again to (B, T, C)
-        keys_new = keys_new.permute(1,0, 2).contiguous() #B, T, C
-        q = q.permute(1, 0, 2).contiguous()  # B , T, C
+        ''' we are not applying RoPE as of now comment out below two lines to apply RoPE'''
+        # keys_new = keys_new.permute(1,0, 2).contiguous() #B, T, C
+        # q = q.permute(1, 0, 2).contiguous()  # B , T, C
 
 
         if use_cache and not self.training:
+            ### sliding window attention ### 
+            old_len = 0 if self.k_cache is None else self.k_cache.shape[1]
             if self.k_cache is None:
                 self.k_cache, self.v_cache  = keys_new, values_new 
             else:
@@ -221,6 +195,16 @@ class Head(nn.Module):
                 self.v_cache = torch.cat([self.v_cache, values_new], dim=1)
 
             
+            # Left trim to sliding window if condfigured 
+            if self.sliding_window_size is not None:
+                if self.k_cache.shape[1] > self.sliding_window_size :
+                    self.k_cache = self.k_cache[:, -self.sliding_window_size:, :]
+                    self.v_cache = self.v_cache[:, -self.sliding_window_size:, :]
+            total_len = old_len + T # T = x.shape[1]
+            k_len_now = self.k_cache.shape[1] 
+            dropped = max(0, total_len - k_len_now) 
+            k_start_pos_abs = (self.ptr_current_pos - old_len) + dropped
+            q_start_pos_abs = self.ptr_current_pos
             keys, values = self.k_cache, self.v_cache 
         else:
             keys, values = keys_new, values_new # B, T, HS
@@ -228,34 +212,63 @@ class Head(nn.Module):
         keys = keys.permute(0, 2, 1).contiguous() # B, HS, T
         attn_scores = q @ keys # B, 1, HS @ B, HS, T  -> B, 1, T
 
+
+        # causal + sliding-window mask
         num_tokens_q = q.shape[1]
-        num_tokens_k = keys.shape[1] 
+        num_tokens_k = keys.shape[2] 
+        device = q.device 
+
+        # Determine absolute position for q and k 
+        if use_cache:
+            q_start = q_start_pos_abs 
+            k_start = k_start_pos_abs 
+        else:
+            q_start = 0
+            k_start = 0 
+        
+
+
+        q_positions = torch.arange(q_start, q_start+num_tokens_q, device=device, dtype=torch.long)
+        k_positions = torch.arange(k_start, k_start+num_tokens_k, device=device, dtype=torch.long)
+
+        # sliding  window _width and put causal mask on that 
+        win_size = num_tokens_k + 1 if self.sliding_window_size is None else (self.sliding_window_size)
+        diff = q_positions.unsqueeze(-1) - k_positions.unsqueeze(0) 
+        mask_bool = (diff < 0) | (diff >= win_size)
 
         if use_cache and not self.training:
-            # mask_bool = self.mask.bool()[
+            ''' build causal mask static way '''
+            # mask_bool = self.mask.bool()[ 
             #     self.pt_curr_pos:self.ptr_current_pos+num_tokens_q, :num_tokens_k
             # ]
             # self.ptr_current_pos += num_tokens_q 
 
-            past_len = self.ptr_current_pos 
+            # past_len = self.ptr_current_pos 
+
             # build rectangular causal mask dynamically 
-            i = torch.arange(num_tokens_q, device=x.device).unsqueeze(1) # T, 1
-            j = torch.arange(num_tokens_k, device=x.device).unsqueeze(0) # 1, T 
+            
+            # i = torch.arange(num_tokens_q, device=x.device).unsqueeze(1) # T, 1
+            # j = torch.arange(num_tokens_k, device=x.device).unsqueeze(0) # 1, T 
 
 
             # each query i can attend to all past (past_len) + tokens up to itself (i)
-            mask_bool = (j > (past_len + i))  # True means MASK
-            # self.ptr_current_pos += num_tokens_q 
+            # mask_bool = (j > (past_len + i))  # True means MASK
+            self.ptr_current_pos += num_tokens_q 
 
 
         else:
             # mask_bool = self.mask.bool()[:num_tokens_q, :num_tokens_k]]
-            i = torch.arange(num_tokens_q, device=x.device).unsqueeze(1)
-            j = torch.arange(num_tokens_k, device=x.device).unsqueeze(0)
-            mask_bool = (j > i)  # simple causal mask for training (no past)
+            # i = torch.arange(num_tokens_q, device=x.device).unsqueeze(1)
+            # j = torch.arange(num_tokens_k, device=x.device).unsqueeze(0)
+            # mask_bool = (j > i)  # simple causal mask for training (no past)
+            self.pt_current_pos = 0
         
+
+
+
         attn_scores.masked_fill(mask_bool, float("-inf"))
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
+        scale = math.sqrt(self.head_size)
+        attn_weights = torch.softmax(attn_scores / scale, dim=-1)
         attn_weights = self.dropout(attn_weights)
         out = attn_weights @ values
 
@@ -314,22 +327,23 @@ class MHA(nn.Module):
         super().__init__()
 
         #O(N**2) computation 
-        # self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
+        self.heads = nn.ModuleList(Head(head_size) for _ in range(num_heads))
 
-        #O(N*W) computation 
+        # O(N*W) computation 
+        # self.head is already having the cumulative heads so we dont need to loop 
+        # it through multiple heads
         # self.heads = nn.ModuleList(LocalWindowAttention(block_size=block_size, 
         #                                                 window_size=64, 
         #                                                 causal=True) 
         #                                                 for _ in range(num_heads)
         #                                                 )
 
-        #self.head is already having the cumulative heads so we dont need to loop 
-        #it through multiple heads
-        self.head = LocalWindowAttention(
-            block_size=block_size, 
-            window_size=64, 
-            causal=True
-            )
+
+        # self.head = LocalWindowAttention( #cumulative heads
+        #     block_size=block_size, 
+        #     window_size=64, 
+        #     causal=True
+        #     )
 
         self.proj = nn.Linear(num_heads*head_size, n_embd)
         self.dropout = nn.Dropout(dropout)
@@ -337,12 +351,14 @@ class MHA(nn.Module):
     def reset_cache(self):
         """Reset KV cache in all heads"""
         # for head in self.head:
-        self.head.reset_cache()
+        # self.head.reset_cache() # this is for SWA 
 
+        for head in self.heads: # in MHA as each head has reset_cache method so we looped through
+            head.reset_cache()
 
     def forward(self, x, use_cache = False):
-        # out = torch.cat([h(x, use_cache = use_cache) for h in self.heads], dim=-1)
-        out = self.head(x, use_cache=use_cache)
+        out = torch.cat([h(x, use_cache = use_cache) for h in self.heads], dim=-1)
+        # out = self.heads(x, use_cache=use_cache)
         out = self.dropout(self.proj(out))
         return out
     
@@ -453,7 +469,14 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
+class GELU(nn.Module):
+    def __init__(self):
+        super(GELU, self).__init__()
 
+    def forward(self, x):
+        return 0.5*x*(1 + torch.tanh(
+            torch.sqrt(torch.tensor(2.0/torch.pi))*(x+0.044715*torch.pow(x, 3))
+        ))
 
 
 class Feedforward(nn.Module):
@@ -461,7 +484,11 @@ class Feedforward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4*n_embd),
-            nn.ReLU(),
+            
+            # nn.ReLU(),
+            # Replace RELU with GELU
+            GELU(),
+
             nn.Linear(n_embd*4, n_embd),
             nn.Dropout(dropout)
         )
@@ -492,9 +519,9 @@ class Block(nn.Module):
         else:
             self.ffn = Feedforward(n_embd)
 
-    def reset_cache(self):
-        """Reset KV cache in attention"""
-        self.sa.reset_cache()
+    # def reset_cache(self):
+    #     """Reset KV cache in attention"""
+    #     self.sa.reset_cache()
 
 
     def forward(self, x, use_cache = False):
@@ -502,9 +529,7 @@ class Block(nn.Module):
 
         if self.use_moe:
             y, aux = self.ffn(self.norm2(x))
-            x = x+y
-        
-
+            x = x+y        
         else:
             # print(self.ln2(x).shape)
             # print()
@@ -536,7 +561,7 @@ class GPT(nn.Module):
 
 
         self.apply(self._init_weights)
-
+        self.current_pos = 0
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -550,7 +575,9 @@ class GPT(nn.Module):
     def reset_cache(self):
         """Reset KV cache in all blocks - call before generation"""
         for block in self.blocks:
-            block.reset_cache()
+            block.sa.reset_cache()
+        self.current_pos = 0
+        
     
     def forward(self, idx, targets = None, use_cache = False):
         B, T = idx.shape  #T-> seq_len (block size)
@@ -558,10 +585,8 @@ class GPT(nn.Module):
 
 
         tok_embd = self.tok_embedding_table(idx) #(B, T, C)
-
         #added RMS norm after the tokenization embedding
         tok_embd = self.rms_norm(tok_embd) #B, T, C 
-
 
         #Pass through RMS Layer as Mistral
         # tok_emb = RMSNorm(dim=tok_embd.shape[-1]) #B, T, C 
@@ -572,8 +597,18 @@ class GPT(nn.Module):
 
         # now we dont need POS_emb here as we are passing it through RoPE 
         # in the attention layer 
+
+
+        ### KV Cache ##### 
+        if use_cache:
+            pos_ids = torch.arange(self.current_pos, self.current_pos+T, device=idx.device, dtype=torch.long)
+            self.current_pos += T 
+        else:
+            pos_ids = torch.arange(0, T, device=idx.device, dtype=torch.long) 
+        pos_embd = self.pos_embedding_table(pos_ids).unsqueeze(0) # (T, C)
+
         
-        x = tok_embd
+        x = tok_embd + pos_embd # Shape [batch_size, num_tokens, emb_size]
 
         for block in self.blocks:
             x, aux = block(x, use_cache=use_cache)
@@ -597,80 +632,98 @@ class GPT(nn.Module):
         return logits, loss 
     
 
-    # def generate(self, idx, max_new_tokens):
-    #     # idx is (B, T) array of indices in the current context
-    #     for _ in range(max_new_tokens):
-    #         # crop idx to the last block_size tokens
-    #         idx_cond = idx[:, -block_size:]
-    #         # get the predictions
-    #         logits, loss = self(idx_cond)
-    #         # focus only on the last time step
-    #         logits = logits[:, -1, :] # becomes (B, C)
-    #         # apply softmax to get probabilities
-    #         probs = F.softmax(logits, dim=-1) # (B, C)
-    #         # sample from the distribution
-    #         idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-    #         # append sampled index to the running sequence
-    #         idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
-    #     return idx
-
-    def generate(self, model, prompt , max_new_tokens=100, top_k=50, temperature=0.8, eos_token=None):
-        model.eval()
-        self.reset_cache()
-        idx = prompt.clone()
+    def generate_simple(self, model, idx, max_new_tokens):
+        # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
 
-            #token by token generation as kv-cache takes one token at a time
-            logits, _ = model(idx[:, -1:], use_cache = True)
-            logits = logits[:, -1, :] / temperature
-
-            # numerical safety clamp
-            logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
-            probs = F.softmax(logits, dim=-1)
 
 
-            topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
-            # next_token = topk_idx.gather(-1, torch.multinomial(topk_probs, 1))
+            # crop idx to the last block_size tokens
+            # Crop current context if it exceeds the supported context size
+            # E.g., if LLM supports only 5 tokens, and the context size is 10
+            # then only the last 5 tokens are used as context
 
-            # top-k filtering and re-normalization
-            topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-            # multinomial sampling
-            next_token_rel = torch.multinomial(topk_probs, 1)
-            next_token = topk_idx.gather(-1, next_token_rel)
+            idx_cond = idx[:, -block_size:]
+            # get the predictions
+            with torch.no_grad():
+                logits, loss = model(idx_cond) 
 
-            idx = torch.cat((idx, next_token), dim=1)
-            if eos_token is not None and next_token.item() == eos_token:
-                break
+
+            # focus only on the last time step
+            # Focus only on the last time step
+            # (batch, n_token, vocab_size) becomes (batch, vocab_size)
+            logits = logits[:, -1, :] 
+
+
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
+    def generate(self, model, prompt , max_new_tokens=100, top_k=50, temperature=0.8, eos_token=None, use_cache = True):
+        model.eval()
+        ctx_len = block_size or model.pos_embedding_table.num_embeddings
+
+        idx = prompt.clone()
+
+        with torch.no_grad():
+            if use_cache:
+                # init cache with full prompt 
+                model.reset_cache() 
+                logits = model(idx[:, -ctx_len:], use_cache=True)
+                if isinstance(logits, tuple):
+                    logits = logits[0]  # first element is usually logits
+                else:
+                    logits = logits
+
+                for _ in range(max_new_tokens):
+                    if logits.dim()==3:
+                        logits = logits[:, -1, :] #(B, vocab_size)
+                    
+                    logits = logits / temperature 
+                    probs = F.softmax(logits, dim=-1)
+                    topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
+                    # top-k filtering and re-normalization
+                    topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8) 
+                    # multinomial sampling
+                    next_token_rel = torch.multinomial(topk_probs, 1)
+                    next_token = topk_idx.gather(-1, next_token_rel)
+                    idx = torch.cat((idx, next_token), dim=1)
+                    if eos_token is not None and next_token.item() == eos_token:
+                        break
+        return idx
+
+        # for _ in range(max_new_tokens):
+
+        #     #token by token generation as kv-cache takes one token at a time
+        #     logits, _ = model(idx[:, -1:])
+        #     logits = logits[:, -1, :] / temperature
+
+        #     # numerical safety clamp
+        #     logits = torch.nan_to_num(logits, nan=-1e4, posinf=1e4, neginf=-1e4)
+        #     probs = F.softmax(logits, dim=-1)
 
 
-#  move to device
-model = GPT()
-model = model.to(device)
+        #     topk_probs, topk_idx = torch.topk(probs, k=top_k, dim=-1)
+        #     # next_token = topk_idx.gather(-1, torch.multinomial(topk_probs, 1))
 
-# correct param-count print 
-print(f"{sum(p.numel() for p in model.parameters())/1e6:.2f} M parameters")
+        #     # top-k filtering and re-normalization
+        #     topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-# sys.exit()
+        #     # multinomial sampling
+        #     next_token_rel = torch.multinomial(topk_probs, 1)
+        #     next_token = topk_idx.gather(-1, next_token_rel)
 
-
-
-# create optimizer 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-
-#mixed preciion training
-from torch.cuda.amp import autocast, GradScaler
-scaler = GradScaler()
+        #     idx = torch.cat((idx, next_token), dim=1)
+        #     if eos_token is not None and next_token.item() == eos_token:
+        #         break
+        # return idx
 
 
-# ===== Checkpoint saving/loading =====
-import os
-
-checkpoint_dir = './checkpoints_v3'
-os.makedirs(checkpoint_dir, exist_ok=True)
 
 def save_checkpoint(model, optimizer, scaler, iter, loss, filepath):
     """Save model checkpoint"""
@@ -709,81 +762,103 @@ def load_checkpoint(filepath, model, optimizer=None, scaler=None):
     print(f"Checkpoint loaded: {filepath}")
     print(f"Resumed from iteration: {checkpoint['iter']}")
     print(f"Loss: {checkpoint['loss']:.4f}")
-    return checkpoint['iter']
+    return checkpoint['iter'], checkpoint["loss"]
+
+@torch.no_grad()
+def estimate_loss(model):
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+def main():
+    torch.manual_seed(1337)
+    model = GPT().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scaler = GradScaler()
+
+    print(f"\nModel has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+
+    # === Resume or Start Fresh ===
+    checkpoint_dir = "./checkpoints_v4"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    resume_path = None  # e.g., "./checkpoints_v3/model_iter_2000.pt"
+    start_iter, best_val_loss = 0, float("inf")
+
+    if resume_path and os.path.exists(resume_path):
+        start_iter, _ = load_checkpoint(resume_path, model, optimizer, scaler)
+        print(f"Resuming from iteration {start_iter}")
+    else:
+        print("Starting training from scratch...")
+
+    # =====================================================
+    #                    TRAINING LOOP
+    # =====================================================
+    for iter in range(start_iter, max_iters):
+
+        # ---- Evaluate periodically ----
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss(model)
+            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+            ckpt_path = os.path.join(checkpoint_dir, f"model_iter_{iter}.pt")
+            save_checkpoint(model, optimizer, scaler, iter, losses["val"], ckpt_path)
+
+            if losses["val"] < best_val_loss:
+                best_val_loss = losses["val"]
+                best_path = os.path.join(checkpoint_dir, "best_model.pt")
+                save_checkpoint(model, optimizer, scaler, iter, losses["val"], best_path)
+                print(f"✅ New best model! val_loss={best_val_loss:.4f}")
+
+        # ---- Training batch ----
+        xb, yb = get_batch("train")
+
+        with autocast(dtype=torch.bfloat16):
+            logits, loss = model(xb, yb)
+
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        if iter % 50 == 0:
+            print(f"Iter {iter} | Loss: {loss.item():.4f}")
+
+    # =====================================================
+    #                     FINAL SAVE
+    # =====================================================
+    final_path = os.path.join(checkpoint_dir, "final_model.pt")
+    save_checkpoint(model, optimizer, scaler, max_iters, loss.item(), final_path)
+    print(f"\n✅ Training Complete | Best val_loss: {best_val_loss:.4f}")
+
+    # =====================================================
+    #                   TEXT GENERATION
+    # =====================================================
+    print("\n" + "=" * 50)
+    print("Generating sample text...")
+    start_context = "hello, i am"
+    encoded = encode(start_context)
+    encoded_tensor = torch.tensor(encoded, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        token_ids = model.generate(model, prompt=encoded_tensor, max_new_tokens=100)
+
+    decoded_text = decode(token_ids[0].tolist())
+    print("\n" + "=" * 50)
+    print(decoded_text)
+    print("=" * 50)
 
 
 
-resume_from_checkpoint = None  # Set to checkpoint path to resume,  './checkpoints/model_iter_5000.pt'
-start_iter = 0
-if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
-    start_iter = load_checkpoint(resume_from_checkpoint, model, optimizer, scaler)
-    print(f"Resuming training from iteration {start_iter}")
-else:
-    print("Starting training from scratch")
-
-# Training loop
-best_val_loss = float('inf')
-
-
-# ===== MoE-aware training loop (loss already includes aux loss from forward) =====
-for iter in range(start_iter, max_iters):
-
-    # evaluate periodically (unchanged)
-    if iter % eval_interval == 0 or iter == max_iters - 1:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-        # Save checkpoint at evaluation intervals
-        checkpoint_path = os.path.join(checkpoint_dir, f'model_iter_{iter}.pt')
-        save_checkpoint(model, optimizer, scaler, iter, losses['val'], checkpoint_path)
-
-        # Save best model
-        if losses['val'] < best_val_loss:
-            best_val_loss = losses['val']
-            best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
-            save_checkpoint(model, optimizer, scaler, iter, losses['val'], best_model_path)
-            print(f"New best model! Val loss: {best_val_loss:.4f}")
-
-
-    # batch
-    xb, yb = get_batch('train')
-
-    # forward:PT.forward already adds aux_total to CE loss
-    logits, loss = model(xb, yb)
-
-    # ======= mixed precsiion training =================
-    with autocast(dtype=torch.bfloat16):
-        logits, loss = model(xb, yb)
-
-    optimizer.zero_grad(set_to_none=True)
-
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    scaler.step(optimizer)
-    scaler.update()
-
-    # loss.backward()
-    # small stability bonus for MoE (optional)
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    # optimizer.step()
-
-
-# Save final model
-final_model_path = os.path.join(checkpoint_dir, 'final_model.pt')
-save_checkpoint(model, optimizer, scaler, max_iters, losses['val'], final_model_path)
-print("\n" + "="*50)
-print(f"Training complete! Best val loss: {best_val_loss:.4f}")
-print(f"Final model saved to: {final_model_path}")
-print(f"Best model saved to: {os.path.join(checkpoint_dir, 'best_model.pt')}")
-print("="*50 + "\n")
-
-# Generate sample text
-print("Generating sample text...")
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-genearted_text = decode(model.generate(model, context, max_new_tokens=500)[0].tolist()) 
-print("\n" + "="*50)
-print("GENERATED TEXT:")
-print("="*50)
-print(genearted_text)
-print("="*50)
+if __name__ == "__main__":
+    main()
