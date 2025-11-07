@@ -26,18 +26,20 @@ def load_and_generate(checkpoint_path, prompt_text="", max_new_tokens=500, tempe
     
     # Encode prompt
     if prompt_text:
-        context = torch.tensor([encode(prompt_text)], dtype=torch.long, device=device)
+        print(prompt_text)
+        encoded = encode(prompt_text)
+        context = torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(0)
+        print(f"context tensor is : {context}")
     else:
         context = torch.zeros((1, 1), dtype=torch.long, device=device)
     
     # Generate
     print(f"\nGenerating with prompt: '{prompt_text}'" if prompt_text else "\nGenerating from scratch...")
     with torch.no_grad():
-        generated = inference_model.generate(inference_model, 
+        generated = inference_model.generate(
+            inference_model, 
             context, 
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k
+            max_new_tokens=max_new_tokens
         )
     
     generated_text = decode(generated[0].tolist())
@@ -45,9 +47,8 @@ def load_and_generate(checkpoint_path, prompt_text="", max_new_tokens=500, tempe
 
 if __name__ == "__main__":
     generated = load_and_generate(
-    checkpoint_path='./checkpoints_v2/best_model.pt',
-    prompt_text='ROMEO:',
-    max_new_tokens=300,
-    temperature=0.8
+    checkpoint_path='./checkpoints_v4/best_model.pt',
+    prompt_text='hii,',
+    max_new_tokens=100
 )
     print(generated)
