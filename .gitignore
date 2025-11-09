@@ -1,5 +1,9 @@
 llm/checkpoints 
 llm/checkpoints_v2
+llm/checkpoints_v3
+llm/checkpoints_v4
+llm/checkpoints_v5
+llm/logs
 *.pt
 *.txt
 llm/__pycache__
