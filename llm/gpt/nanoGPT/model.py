@@ -236,7 +236,7 @@ max_length = 30
 device = "cuda"
 
 model = GPT.from_pretrained("gpt2")
-print("did not crash yay!!")
+# print("did not crash yay!!")
 
 model.to(device=device)
 model.eval() 
