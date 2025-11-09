@@ -3,6 +3,8 @@ llm/checkpoints_v2
 llm/checkpoints_v3
 llm/checkpoints_v4
 llm/checkpoints_v5
+llm/checkpoints_hf
+
 llm/logs
 *.pt
 *.txt
