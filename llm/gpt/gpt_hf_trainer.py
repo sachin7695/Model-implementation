@@ -352,7 +352,7 @@ class GPTForCausalLM(PreTrainedModel):
                 self.current_pos + T, 
                 device=input_ids.device, 
                 dtype=torch.long
-            )
+            )drop = nn.Dropout(config.dropout),
             self.current_pos += T
         else:
             pos_ids = torch.arange(0, T, device=input_ids.device, dtype=torch.long)
