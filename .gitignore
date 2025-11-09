@@ -11,3 +11,5 @@ llm/__pycache__
 *.wav
 tts/LJSpeech-1.1
 diffusion/
+*.safetensors
+*.bin
