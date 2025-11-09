@@ -412,9 +412,11 @@ class TextDataset(Dataset):
     def __getitem__(self, idx):
         x = self.data[idx:idx + self.block_size]
         y = self.data[idx + 1:idx + self.block_size + 1]
+        attention_mask = torch.ones_like(x, dtype=torch.long)
         return {
             'input_ids': x,
-            'labels': y
+            'labels': y,
+            'attention_mask':attention_mask
         }
 
 
@@ -422,12 +424,22 @@ class TextDataset(Dataset):
 #           DATA COLLATOR
 # =====================================================
 def collate_fn(batch):
-    """Custom collator to handle dict format"""
-    input_ids = torch.stack([torch.tensor(item['input_ids']) for item in batch])
-    labels = torch.stack([torch.tensor(item['labels']) for item in batch])
+    """
+    Pads variable-length examples in a batch
+    """
+    input_ids = [item['input_ids'] for item in batch]
+    labels = [item['labels'] for item in batch]
+    masks = [item['attention_mask'] for item in batch]
+
+    # pad sequences to max length in batch
+    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+    labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)  # -100 ignores in loss
+    masks = torch.nn.utils.rnn.pad_sequence(masks, batch_first=True, padding_value=0)
+
     return {
         'input_ids': input_ids,
-        'labels': labels
+        'labels': labels,
+        'attention_mask': masks
     }
 
 
