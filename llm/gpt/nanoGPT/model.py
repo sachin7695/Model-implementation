@@ -1,5 +1,5 @@
 import math 
-import inspect 
+import inspect , time
 from dataclasses import dataclass 
 import sys
 import torch 
@@ -121,7 +121,7 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
         # weight sharing scheme
-        self.transformer.wte.weight = self.lm_head
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init params 
         self.apply(self._init_weights)
@@ -298,27 +298,64 @@ class DataLoaderLite:
 
         return x, y 
 
+# learning rate decay scheduler (cosine with warmup)
+max_steps = 50
+max_lr = 6e-4 
+min_lr = 6e-4 * 0.1 # 10 percent of max_lr 
+warmup_steps = 10
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / (warmup_steps + 1)
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return min_lr + coeff * (max_lr - min_lr)
+
 
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(B = 8, T = 64)
+# earlier it was FP 32 right now its is TF32 (8x) throughput improvement
+torch.set_float32_matmul_precision('high') # not all gpu has TF32
 
 
 # get logits 
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) # 50304 is a power of 2
 model.to(device)
+# compile the Model
+model = torch.compile(model) 
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(max_steps):
+    t0 = time.time()
     x,y = train_loader.next_batch() # x, y already in GPU!!
-
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    # Autocast mixed precision training limited to logits and loss calculation 
+    # rest of the operations are TF32
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+
+    # clipping the gradient norm
+    norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0) 
+    # Determine and set the lr for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() # wait till the task done from gpu
+    t1 = time.time()
+    dt = (t1-t0)*1000 # in ms 
+    tokens_per_second = (train_loader.B*train_loader.T)/(t1-t0)
+    print(f"step {step}, loss: {loss.item()} | norm {norm:.4f} | dt: {dt:.2f}ms, tok/sec: {tokens_per_second:.2f}")
 
 
 
