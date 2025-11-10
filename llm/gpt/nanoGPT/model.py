@@ -53,16 +53,38 @@ class CausalSelfAttention(nn.Module):
                                                     .view(1, 1, config.block_size, config.block_size)))
             
         # self.c_proj.NANOGPT_SCALE_INIT = 1
+        # KV cache buffer
+        self.register_buffer("cache_k", None, persistent=False)
+        self.register_buffer("cache_v", None, persistent=False)
+        self.ptr_current_pos = 0
         
-    def forward(self, x):
+    def forward(self, x, use_cache = False):
         B, T, C = x.size()  # T-> sequence length C = n_embed 
 
-        # for each B calculate q, k, v 
-        q, k, v = self.c_attn(x).split(self.n_embed, dim = 2) 
-        # B, T, C -> B, T, nh, C -> B, nh, T, C
-        k = k.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous() 
+        # for each B calculate q, k, v
+        k_new, v_new, q = self.c_attn(x).split(self.n_embed, dim=2)
+        k_new =  k_new.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous()
         q = q.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous()
-        v = v.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous()
+        v_new = v_new.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous()
+
+
+        ####### KV CACHE IMPLEMENTATION #######
+        if use_cache and not self.training:
+            if self.cache_k is None:
+                self.cache_k, self.cache_v = k_new, v_new 
+            else:
+                self.cache_k = torch.cat([self.cache_k, k_new], dim=1)
+                self.cache_v = torch.cat([self.cache_v, v_new], dim=1)
+            k, v = self.cache_k, self.cache_v 
+        else:
+            k, v = k_new, v_new 
+        
+        ####### OLD IMPLEMENTATION #######
+        # q, k, v = self.c_attn(x).split(self.n_embed, dim = 2) 
+        # B, T, C -> B, T, nh, C -> B, nh, T, C
+        # k = k.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous() 
+        # q = q.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous()
+        # v = v.view(B, T,self.n_head, C // self.n_head).permute(0, 2, 1, 3).contiguous()
 
         if self.flash:
             y = torch.nn.functional.scaled_dot_product_attention(q,k, v, attn_mask=None, 
@@ -81,8 +103,9 @@ class CausalSelfAttention(nn.Module):
         return y  
 
 
-
-
+    def reset_cache(self):
+            self.cache_k, self.cache_v = None, None 
+            self.ptr_curr_pos = 0
 
 
 
@@ -96,8 +119,8 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embed) 
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, use_cache=False):
+        x = x + self.attn(self.ln_1(x), use_cache=use_cache)
         x = x + self.mlp(self.ln_2(x))
         return x 
     
@@ -118,11 +141,12 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embed)
         ))
-        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
+        self.current_pos = 0
+
+        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
-
         # init params 
         self.apply(self._init_weights)
 
@@ -144,13 +168,6 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
-
-
-
-    
-
-
 
 
     @classmethod 
@@ -205,19 +222,28 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model 
     
-    def forward(self, idx, targets = None):
+    def forward(self, idx, targets = None, use_cache = False):
 
         device = idx.device 
         b, t = idx.size()  # this t can not be more than block size         
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) 
+        # pos = torch.arange(0, t, dtype=torch.long, device=device) 
+
+        if use_cache:
+            pos = torch.arange(self.current_pos, self.current_pos+t, device=idx.device, dtype=torch.long)
+            self.current_pos += t 
+        else:
+            pos = torch.arange(0, t, device=idx.device, dtype=torch.long)
+    
+        pos_emb = self.transformer.wpe(pos).unsqueeze(0)
 
         # forward propagation 
         tok_emb = self.transformer.wte(idx) #b, t, n_embed 
-        pos_emb = self.transformer.wpe(pos) #t, n_embed 
+        # pos_emb = self.transformer.wpe(pos) #t, n_embed 
+
         x = self.transformer.drop(tok_emb+pos_emb) # implicit broadcasting 
         for block in self.transformer.h:
-            x = block(x) # n_layers of transformer block 
+            x = block(x, use_cache=use_cache) # n_layers of transformer block 
 
         x = self.transformer.ln_f(x) # layer normalization 
         loss = None 
@@ -231,6 +257,11 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             # logits = logits[:, -1, :] # last time step 
         return logits, loss
+    
+    def reset_kv_cache(self):
+        for blk in self.trf_blocks:
+            blk.att.reset_cache()
+        self.current_pos = 0
 
     
 
@@ -256,6 +287,32 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1) 
+        return idx
+    
+    def generate_text_simple_cached(self,model, idx, max_new_tokens,
+                                context_size=None, use_cache=True):
+        model.eval()
+        ctx_len = context_size or model.pos_emb.num_embeddings
+
+        with torch.no_grad():
+            if use_cache:
+                # Init cache with full prompt
+                model.reset_kv_cache()
+                logits = model(idx[:, -ctx_len:], use_cache=True)
+
+                for _ in range(max_new_tokens):
+                    # a) pick the token with the highest log-probability (greedy sampling)
+                    next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                    # b) append it to the running sequence
+                    idx = torch.cat([idx, next_idx], dim=1)
+                    # c) feed model only the new token
+                    logits = model(next_idx, use_cache=True)
+            else:
+                for _ in range(max_new_tokens):
+                    logits = model(idx[:, -ctx_len:], use_cache=False)
+                    next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                    idx = torch.cat([idx, next_idx], dim=1)
+
         return idx
     
 
