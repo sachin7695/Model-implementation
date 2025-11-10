@@ -1,7 +1,7 @@
 import math 
 import inspect 
 from dataclasses import dataclass 
-
+import sys
 import torch 
 import torch.nn as nn 
 from torch.nn import functional as F  
@@ -52,7 +52,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(size=(config.block_size, config.block_size))
                                                     .view(1, 1, config.block_size, config.block_size)))
             
-
+        # self.c_proj.NANOGPT_SCALE_INIT = 1
         
     def forward(self, x):
         B, T, C = x.size()  # T-> sequence length C = n_embed 
@@ -119,6 +119,34 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embed)
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head
+
+        # init params 
+        self.apply(self._init_weights)
+
+        # To solve the growing variance 
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer)) # per attention 2 resdiual
+
+    
+
+    # init weights 
+    def _init_weights(self, module):
+        std = 0.02
+
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+
+
 
     
 
@@ -231,9 +259,76 @@ class GPT(nn.Module):
         return idx
     
 
-num_return_sequences = 5 
-max_length = 30 
+num_return_sequences = 6
+max_length = 50 
 device = "cuda"
+
+import tiktoken 
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B 
+        self.T = T 
+
+        with open("/home/cmi_10101/Documents/coding/pytorch/architecture-implementation/input.txt", mode="r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text) 
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches") 
+
+        # state
+        self.current_position = 0 
+
+    def next_batch(self):
+        B,T = self.B, self.T 
+        buf = self.tokens[self.current_position:self.current_position+B*T+1] #exact B*T times tokens
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position+=B*T 
+        # loading the next batch reset the self.current_position
+        '''
+        That means we’ve hit the end of the dataset, 
+        so the next call will start reading from the beginning again (fresh epoch).
+        '''
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position = 0 
+        x, y = x.to(device), y.to(device)
+
+        return x, y 
+
+
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+train_loader = DataLoaderLite(4, 32)
+
+
+# get logits 
+model = GPT(GPTConfig())
+model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x,y = train_loader.next_batch() # x, y already in GPU!!
+
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+
+
+sys.exit(0)
+
+
+
+
+
+
 
 model = GPT.from_pretrained("gpt2")
 # print("did not crash yay!!")
@@ -241,10 +336,6 @@ model = GPT.from_pretrained("gpt2")
 model.to(device=device)
 model.eval() 
 
-#test sample 
-import tiktoken 
-enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model, ")
 tokens = torch.tensor(tokens, dtype=torch.long, device=device) #(t,)
 #(t, ) -> (5, t)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # repeat across first dim
