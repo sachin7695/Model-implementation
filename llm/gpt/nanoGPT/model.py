@@ -378,9 +378,14 @@ def get_lr(it):
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
-train_loader = DataLoaderLite(B = 8, T = 64)
 # earlier it was FP 32 right now its is TF32 (8x) throughput improvement
 torch.set_float32_matmul_precision('high') # not all gpu has TF32
+
+total_batch_size = 524288 
+B, T = 4, 1024 
+grad_acum_steps = total_batch_size // (B*T) 
+train_loader = DataLoaderLite(B = B, T = T)
+
 
 
 # get logits 
@@ -392,27 +397,30 @@ model = torch.compile(model)
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for step in range(max_steps):
     t0 = time.time()
-    x,y = train_loader.next_batch() # x, y already in GPU!!
     optimizer.zero_grad()
-    # Autocast mixed precision training limited to logits and loss calculation 
-    # rest of the operations are TF32
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0  
+    for micro_grad in range(grad_acum_steps):
+        x,y = train_loader.next_batch() # x, y already in GPU!!
+        # Autocast mixed precision training limited to logits and loss calculation 
+        # rest of the operations are TF32
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_acum_steps 
+        loss_accum += loss.detach()
+        loss.backward()
 
     # clipping the gradient norm
     norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0) 
     # Determine and set the lr for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    
+        param_group['lr'] = lr 
     optimizer.step()
     torch.cuda.synchronize() # wait till the task done from gpu
     t1 = time.time()
     dt = (t1-t0)*1000 # in ms 
     tokens_per_second = (train_loader.B*train_loader.T)/(t1-t0)
-    print(f"step {step}, loss: {loss.item()} | norm {norm:.4f} | dt: {dt:.2f}ms, tok/sec: {tokens_per_second:.2f}")
+    print(f"step {step}, loss: {loss_accum.item()} | norm {norm:.4f} | dt: {dt:.2f}ms, tok/sec: {tokens_per_second:.2f}")
 
 
 
