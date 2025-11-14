@@ -7,8 +7,12 @@ import numpy as np
 import torch
 from einops import rearrange
 from transformers import MimiModel
+from torchaudio import transforms as T
 
 from codec import Codec
+
+# importing Neucodec
+from neucodec import NeuCodec, DistillNeuCodec
 
 T = TypeVar("T")
 
@@ -335,6 +339,39 @@ class MimiTokenizer(Tokenizer[np.ndarray]):
     def downscaling_factor(self):
         return int(self.sample_rate() / self.mimi.config._frame_rate)
 
+class NeuCodec_Codec(Tokenizer[np.ndarray]):
+    def __init__(self):
+        # pip install neucodec 
+        self.sr = 16000 # 16khz resampling
+        self.model = self.model_init()
+        self.device = "cuda"
+        self.model.eval().cuda()
+
+
+    def model_init(self, name ="neuphonic/neucodec"):
+        model = NeuCodec.from_pretrained("neuphonic/neucodec")  
+        return model 
+    def encode(self, raw: np.ndarray) -> torch.tensor:
+        audio = torch.Tensor(raw).to(self.device)
+
+        is_batched = audio.ndim==2
+        if not is_batched:
+            audio = audio[None, :] 
+        if self.sr != 16_000:
+            audio = T.Resample(self.sr, 16_000)(audio)
+        audio = rearrange(audio, "b t -> b 1 t")
+        with torch.no_grad():
+            fsq_codes = self.model.enode_code(audio) 
+            print(f"Codes shape: {fsq_codes.shape}")
+
+        return fsq_codes 
+    
+    def decode(self, tokens:torch.Tensor) -> np.ndarray:
+        recon_audio = self.model.decode_code(tokens).cpu() 
+        return recon_audio[0,:, :]
+
+        
+
 
 def audio_tokenizer_from_name(name: str, device: str = "cuda"):
     if name.startswith("codec"):
@@ -344,7 +381,7 @@ def audio_tokenizer_from_name(name: str, device: str = "cuda"):
     elif name == "mu-law-256":
         return MuLawTokenizer()
     elif name == "neucodec":
-        # return NeuCodec()
+        return NeuCodec_Codec()
         pass
     else:
         raise ValueError(f"Could not parse audio tokenizer name: {name}")
