@@ -369,8 +369,17 @@ class NeuCodec_Codec(Tokenizer[np.ndarray]):
     def decode(self, tokens:torch.Tensor) -> np.ndarray:
         recon_audio = self.model.decode_code(tokens).cpu() 
         return recon_audio[0,:, :]
-
-        
+    
+    def vocab_size(self):
+        return 65536 # codebook size 
+    
+    def dtype(self):
+        return torch.int32
+    
+    def sample_rate(self) -> int:
+        # Always 24000 in practice, but let's not hardcode
+        return self.sr
+     
 
 
 def audio_tokenizer_from_name(name: str, device: str = "cuda"):
@@ -382,6 +391,5 @@ def audio_tokenizer_from_name(name: str, device: str = "cuda"):
         return MuLawTokenizer()
     elif name == "neucodec":
         return NeuCodec_Codec()
-        pass
     else:
         raise ValueError(f"Could not parse audio tokenizer name: {name}")
