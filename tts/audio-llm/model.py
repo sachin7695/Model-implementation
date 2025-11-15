@@ -316,9 +316,9 @@ class GPT(nn.Module):
         return idx
     
 
-num_return_sequences = 6
-max_length = 50 
-device = "cuda"
+num_return_sequences = 10
+max_length = 50
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 import tiktoken 
 
