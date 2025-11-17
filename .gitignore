@@ -5,6 +5,8 @@ llm/checkpoints_v4
 llm/checkpoints_v5
 llm/checkpoints_hf
 llm/logs
+encoder-decoder-network/data
+encoder-decoder-network/__pycache__
 *.pt
 *.txt
 llm/__pycache__
