@@ -29,7 +29,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}") 
 
 ### Import Model ###
-from linear_vae import LinearVAE 
+from vae import LinearVAE 
 
 ### Prep Dataset ###
 tensor_transforms = transforms.Compose(
@@ -171,22 +171,6 @@ def train(model,
 def main():
     models = []
     encoded_datas = []
-
-    # # Train our Vanilla AutoEncoder 
-    # model = LinearVAE()
-    # model, train_losses, evaluation_losses, encoded_data_per_eval = train(
-    #     model,
-    #     kl_weight=None,
-    #     train_set=train_set,
-    #     test_set=test_set,
-    #     batch_size=64,
-    #     training_iterations=25000,
-    #     evaluation_iterations=250,
-    #     model_type="AE"
-    # )
-
-    # models.append(model)
-    # encoded_datas.append(encoded_data_per_eval)
 
     # Train our Variational AutoEncoders with different KL Weights
     kl_weights = [1, 100]
