@@ -242,3 +242,148 @@ class ConvolutionalVectorQuantizedVAE(nn.Module):
         latents = self.forward_enc(x)
         quantized_latents, decoded, codebook_loss, commitment_loss = self.forward_dec(latents)
         return latents, quantized_latents, decoded, codebook_loss, commitment_loss
+    
+
+class LinearResidualVectorQuantizedVAE(nn.Module):
+    def __init__(self, latent_dim=2, codebook_size=64, num_codebooks=4):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(32*32, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64), 
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, latent_dim)
+        )
+        
+        #############################################################
+        ###  Stack of Codebooks for Residual Vector Quantization  ###
+        self.rvq = nn.ModuleList(
+            [
+                VectorQuantizer(codebook_size, latent_dim) for _ in range(num_codebooks)
+            ]
+        )
+        
+        #############################################################
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 32*32),
+            nn.Sigmoid()
+        )
+
+
+    def forward_enc(self, x):
+
+        x = self.encoder(x)
+    
+        return x
+
+    def quantize(self, z, return_code_idx_only=False):
+        
+        #############################################
+        ## Quantize the Latent Space Representation #
+
+        codebook_losses = 0
+        commitment_losses = 0
+        quantized_codes = []
+        code_indexes = []
+        final_quantized = torch.zeros_like(z)
+        
+        for quantizer in self.rvq:
+
+            ### Get Closest Codes ###
+            codes, code_idx = quantizer(z)
+
+            ### Store code Indexes ###
+            code_indexes.append(code_idx)
+
+            ### Compute VQ Loss ###
+            codebook_loss = torch.mean((codes - z.detach())**2)
+            commitment_loss = torch.mean((codes.detach() - z)**2)
+
+            codebook_losses += codebook_loss
+            commitment_losses += commitment_loss
+
+            ### Straight Through Gradients ###
+            codes = z + (codes - z).detach()
+
+            ### Accumulate Codes for Final Quantized ###
+            final_quantized = final_quantized + codes
+
+            ### Store Quantized ###
+            quantized_codes.append(codes)
+            
+            ### Update Z to be the Residual Error (But dont compute gradients) ###
+            z = z - codes.detach()
+            
+        #############################################
+       
+        if return_code_idx_only:
+            return torch.stack(code_indexes, dim=-1)
+        else:
+            return final_quantized, codebook_losses, commitment_losses
+
+    def forward_dec(self, x):
+        codes, codebook_losses, commitment_losses = self.quantize(x)
+        decoded = self.decoder(codes)
+        return codes, decoded, codebook_losses, commitment_losses
+
+    @torch.no_grad()
+    def get_codes(self, x):
+
+        ### Get the Code Indexes for A Batch of Images ###
+        x = x.flatten(1)
+        x = self.encoder(x)
+        code_idx = self.quantize(x, return_code_idx_only=True)
+        return code_idx
+
+    @torch.no_grad()
+    def decode_codes(self, code_idx):
+
+        ### Create Empty Tensor to Accumulate RVQ Codes into ###
+        batch_size = code_idx.shape[0]
+        rvq_codes = torch.zeros(batch_size, self.latent_dim, device=code_idx.device)
+
+        ### Loop Through Quantizer and Grab the Correct Codes ###
+        for idx, quantizer in enumerate(self.rvq):
+            q_codes = code_idx[:, idx]
+
+            ### Accumulate the Codes into our rvq codes ###
+            quantized_embeddings = quantizer.embedding(q_codes)
+            rvq_codes += quantized_embeddings
+
+        ### Decode Back to Image Space ###
+        decoded = self.decoder(rvq_codes)
+
+        decoded = decoded.reshape(batch_size, 1, 32, 32)
+
+        return decoded
+        
+
+    def forward(self, x):
+        
+        batch, channels, height, width = x.shape
+        
+        ### Flatten Image to Vector ###
+        x = x.flatten(1)
+
+        ### Pass Through Encoder ###
+        latents = self.forward_enc(x)
+        
+        ### Pass Sampled Data Through Decoder ###
+        quantized_latents, decoded, codebook_loss, commitment_loss = self.forward_dec(latents)
+
+        ### Put Decoded Image Back to Original Shape ###
+        decoded = decoded.reshape(batch, channels, height, width)
+
+        return latents, quantized_latents, decoded, codebook_loss, commitment_loss
