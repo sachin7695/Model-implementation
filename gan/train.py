@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 # from sklearn.manifold import TSNE
 
 # Models import 
-from model import MNISTDiscriminator, MNISTGenerator 
+from model import MNISTDiscriminator, MNISTGenerator, MNISTConditionalDiscriminator, MNISTConditionalGenerator
 
 
 ### Stuff to Visualize the Latent Space ###
@@ -36,12 +36,18 @@ batch_size = 64
 epochs = 200
 generator_lr = 3e-4 
 discriminator_lr = 3e-4 
+CONDITIONAL = True
 
-# Define models 
-generator = MNISTGenerator(latent_dim=latent_dimension).to(device=device)
-discriminator = MNISTDiscriminator().to(device=device)
+# Define models
+if CONDITIONAL: 
+    generator = MNISTConditionalGenerator().to(device)
+    discriminator = MNISTConditionalDiscriminator().to(device)
+else:
+    generator = MNISTGenerator(latent_dim=latent_dimension).to(device=device)
+    discriminator = MNISTDiscriminator().to(device=device)
 
 # Define optimizers 
+
 gen_optimizer = optim.AdamW(generator.parameters(), lr=generator_lr)
 disc_optimizer = optim.AdamW(discriminator.parameters(), lr=discriminator_lr)
 
@@ -86,7 +92,9 @@ def train_unconditional_gan(gen, disc,
 
             # Train Discriminator   
             noise = torch.randn(B, latent_dimension, device=device)
+
             #  Create Labels for Discriminator with label smoothing
+            # we are not using MNIST data labels we are just assigning true as 1 and fake as 0 that's it!!
             generated_labels = torch.zeros(B, 1, device=device) + label_smoothing
             true_labels = torch.ones(B, 1, device=device) - label_smoothing 
 
@@ -101,7 +109,7 @@ def train_unconditional_gan(gen, disc,
             real_loss = loss_func(real_disc_pred, true_labels)
             fake_loss = loss_func(gen_disc_pred, generated_labels) 
             disc_loss = (real_loss+fake_loss) / 2 
-            disc_epoch_losses.append(disc_loss) 
+            disc_epoch_losses.append(disc_loss.item()) 
 
             # update Discriminator 
             disc_optim.zero_grad() # before training step of each model zeroing grads as its accumuluated of previous 
@@ -118,8 +126,8 @@ def train_unconditional_gan(gen, disc,
             gen_loss = loss_func(gen_disc_pred, true_labels) # pretend as true images 
             gen_epoch_losses.append(gen_loss.item())
 
-            gen_optim.zero_grad()
-            gen_loss.backward()
+            gen_optim.zero_grad() # before training step of each model zeroing grads as its loss accumuluated of previously 
+            gen_loss.backward() # this loss contain both gen and disc only the naming is gen_loss dont get confuse
             gen_optim.step()
 
         gen_epoch_losses = np.mean(gen_epoch_losses)
@@ -151,3 +159,109 @@ def train_unconditional_gan(gen, disc,
     return gen, disc, gen_losses, disc_losses
 
 
+def train_conditional_gan(
+                        generator, 
+                        discriminator, 
+                        generator_optimizer, 
+                        discriminator_optimizer, 
+                        dataloader,
+                        label_smoothing=0.05,
+                        epochs=200,
+                        device="cpu", 
+                        plot_generation_freq=50,
+                        plot_loss_freq=20,
+                        num_classes=10
+                        ):
+    loss_func  = nn.BCEWithLogitsLoss()
+    gen_losses, disc_losses = [], [] 
+
+    for epoch in tqdm(range(epochs)):
+        generator_epoch_losses = []
+        discriminator_epoch_losses = []
+
+        for images, true_digits in dataloader:
+            B = images.shape[0] 
+            images = images.to(device) # real images 
+            true_digits = true_digits.to(device) # true labels of MNIST digit  
+
+            # Train Discriminator 
+            # NEW: Sample noise/random digits for Generation 
+            rand_digits = torch.randint(0, num_classes, size=(B, ), device=device)
+            noise = torch.randn(B, latent_dimension, device=device) 
+
+            # create labels 
+            generated_labels = torch.zeros(B, 1, device=device) + label_smoothing 
+            true_labels = torch.ones(B, 1, device=device) - label_smoothing 
+
+            # sample G(z) and remove it from comp graph 
+            generated_images = generator(noise, rand_digits).detach() 
+
+            # pass to Discriminator 
+            real_discriminator_pred = discriminator(images, true_digits)
+            gen_discriminator_pred = discriminator(generated_images, rand_digits) 
+
+            # compute Disc loss 
+            real_loss = loss_func(real_discriminator_pred, true_labels) 
+            fake_loss = loss_func(gen_discriminator_pred, generated_labels) 
+            discriminator_loss = (real_loss + fake_loss) / 2 
+            discriminator_epoch_losses.append(discriminator_loss.item())
+
+            # update the weights with optimizer 
+            discriminator_optimizer.zero_grad()
+            discriminator_loss.backward()
+            discriminator_optimizer.step() 
+
+            # Train Generator 
+            # Sample noise for Generation 
+            rand_digits = torch.randint(0,num_classes, size=(B,), device=device)
+            noise = torch.randn(B, latent_dimension, device=device)
+            generated_images = generator(noise, rand_digits) 
+            gen_discriminator_pred = discriminator(generated_images, rand_digits)
+
+            # loss 
+            generator_loss = loss_func(gen_discriminator_pred, true_labels) # pretend as true so true labels 
+            generator_epoch_losses.append(generator_loss.item()) 
+
+            generator_optimizer.zero_grad()
+            generator_loss.backward()
+            generator_optimizer.step()
+
+        generator_epoch_losses = np.mean(generator_epoch_losses)
+        discriminator_epoch_losses = np.mean(discriminator_epoch_losses)
+
+        if epoch % plot_loss_freq == 0:
+            print(f"Epoch: {epoch}/{epochs} | Generator Loss: {generator_epoch_losses} | Discriminator Loss: {discriminator_epoch_losses}")
+    
+        gen_losses.append(generator_epoch_losses)
+        disc_losses.append(discriminator_epoch_losses)
+    
+        if epoch % plot_generation_freq == 0:
+            generator.eval()
+            with torch.no_grad():
+                digits = torch.arange(num_classes, device=device)
+                noise_sample = torch.randn(num_classes, latent_dimension, device=device)
+                generated_imgs = generator(noise_sample, digits).to("cpu")
+        
+                fig, ax = plt.subplots(1,num_classes, figsize=(15,5))
+        
+                for i in range(num_classes):
+                    img = (generated_imgs[i].squeeze() + 1)/2
+                    ax[i].imshow(img.numpy(), cmap="gray")
+                    ax[i].set_axis_off()
+        
+                plt.show()
+                
+            generator.train()
+
+    return generator, discriminator, gen_losses, disc_losses 
+
+
+# generator, discriminator, gen_losses, disc_losses = train_conditional_gan(generator=generator, 
+#                                                                           discriminator=discriminator, 
+#                                                                           generator_optimizer=gen_optimizer, 
+#                                                                           discriminator_optimizer=disc_optimizer, 
+#                                                                           dataloader=trainloader,
+#                                                                           epochs=200,
+#                                                                           device="cuda", 
+#                                                                           plot_generation_freq=40,
+#                                                                           plot_loss_freq=40)
