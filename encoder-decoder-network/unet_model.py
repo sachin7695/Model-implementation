@@ -82,14 +82,19 @@ class UNET(nn.Module):
 
             # after residual blocks do downsampling 
             self.encoder_config.append(((d, d), "downsample")) # do not change the number of channels 
-            # If we are not at the last channel size include a channel upsample (typically by factor of 2) 
-            if idx < len(channel_sizes) - 1: # that Red Arrow 
-                self.encoder_config.append(((d,channel_sizes[idx+1]), "residual")) # Shape: (Batch x Channels x Height x Width) -> (Batch x Channels*2 x Height x Width)
 
-        ### The Bottleneck will have "residual_blocks_per_group" number of ResidualBlocks each with the input/output of our final channel size###
+            # If we are not at the last channel size include a channel upsample (typically by factor of 2) 
+            if idx < len(channel_sizes) - 1: # that Red Arrow in the digram
+                self.encoder_config.append(((d,channel_sizes[idx+1]), "residual"))
+
+        # print(self.encoder_config)
+
+        # The Bottleneck will have "residual_blocks_per_group" number of ResidualBlocks each with the input/output of our final channel size
         self.bottleneck_config = []
         for _ in range(residual_blocks_per_group):
             self.bottleneck_config.append(((ending_channel_size, ending_channel_size), "residual"))
+
+        # print(self.bottleneck_config)
 
         # fineal output sahpe of bottleneck and encoder ouutput 
         out_dim = ending_channel_size 
@@ -98,9 +103,10 @@ class UNET(nn.Module):
         reversed_encoder_config = self.encoder_config[::-1] 
         self.decoder_config = []
         for idx, (metadata, type) in enumerate(reversed_encoder_config):
+            print(metadata, type)
             enc_in_channels, enc_out_channels = metadata 
             concat_num_channels = out_dim + enc_out_channels if self.skip_connection else out_dim  
-            self.decoder_config.append(((concat_num_channels, enc_in_channels), "residual"))
+            self.decoder_config.append(((concat_num_channels, enc_in_channels), "residual")) # we are inverting the encoder block thats why enc_in_channels 
             if type == "downsample":
                 # If we did a downsample in our encoder, we need to upsample in our decoder 
                 self.decoder_config.append(((enc_in_channels, enc_in_channels), "upsample"))
@@ -108,14 +114,17 @@ class UNET(nn.Module):
             # The new out_dim will be the number of output channels from our block (or the cooresponding encoder input channels)
             out_dim = enc_in_channels
 
+        # print(self.decoder_config)
 
+        # this is for extra conv at the beginning which we did to convert 3 channels to 64 channels 
+        # we will amke sure this skip connection also we use
         concat_num_channels = starting_channel_size*2 if self.skip_connection else starting_channel_size
         self.decoder_config.append(((concat_num_channels, starting_channel_size), "residual"))
 
         self.conv_in_proj = nn.Conv2d(self.input_image_channels, 
                                       starting_channel_size, 
                                       kernel_size=3, 
-                                      padding="same")
+                                      padding="same") # resolution same
         
         self.encoder = nn.ModuleList()
         for metadata, type in self.encoder_config:
@@ -131,7 +140,7 @@ class UNET(nn.Module):
                               out_channels, 
                               kernel_size=3, 
                               stride=2, 
-                              padding=1)
+                              padding=1) # downsample by factor of 2 
                     )
 
         
@@ -157,11 +166,17 @@ class UNET(nn.Module):
                                                   out_channels=out_channels,
                                                   interpolate=self.interpolate))
 
-        ### Output Convolution ###
+        # Output Convolution
         self.conv_out_proj = nn.Conv2d(in_channels=starting_channel_size, 
                                        out_channels=num_classes,
                                        kernel_size=3, 
                                        padding="same")
+        
+
+        # print(self.encoder)
+        # print(self.bottleneck)
+        # print(self.decoder)
+
     def forward(self, x):
         residuals = []
 
@@ -201,3 +216,8 @@ class UNET(nn.Module):
         x = self.conv_out_proj(x)
 
         return x
+    
+if __name__ == "__main__":
+    rand = torch.randn(4,3,256,256)
+    unet = UNET()
+    print(unet)
